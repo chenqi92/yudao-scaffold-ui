@@ -1,0 +1,119 @@
+<svg width="1024" height="1024" viewBox="0 0 1024 1024" fill="none" xmlns="http://www.w3.org/2000/svg">
+  <svg x="100" y="100" width="824" height="824" viewBox="0 0 1024 1024" fill="none" xmlns="http://www.w3.org/2000/svg">
+    <defs>
+      <linearGradient id="bgGrad" x1="220" y1="120" x2="840" y2="880" gradientUnits="userSpaceOnUse">
+        <stop offset="0" stop-color="#38BDF8"/>
+        <stop offset="0.48" stop-color="#2563EB"/>
+        <stop offset="1" stop-color="#7C3AED"/>
+      </linearGradient>
+
+      <linearGradient id="paperGrad" x1="310" y1="210" x2="700" y2="770" gradientUnits="userSpaceOnUse">
+        <stop offset="0" stop-color="#FFFFFF"/>
+        <stop offset="1" stop-color="#EAF4FF"/>
+      </linearGradient>
+
+      <linearGradient id="accentGrad" x1="295" y1="655" x2="800" y2="655" gradientUnits="userSpaceOnUse">
+        <stop offset="0" stop-color="#22C55E"/>
+        <stop offset="0.5" stop-color="#38BDF8"/>
+        <stop offset="1" stop-color="#8B5CF6"/>
+      </linearGradient>
+
+      <linearGradient id="wandGrad" x1="246" y1="632" x2="407" y2="471" gradientUnits="userSpaceOnUse">
+        <stop offset="0" stop-color="#0F172A"/>
+        <stop offset="0.58" stop-color="#1E293B"/>
+        <stop offset="1" stop-color="#FBBF24"/>
+      </linearGradient>
+
+      <filter id="softShadow" x="110" y="75" width="820" height="860" filterUnits="userSpaceOnUse" color-interpolation-filters="sRGB">
+        <feDropShadow dx="0" dy="28" stdDeviation="34" flood-color="#0F172A" flood-opacity="0.24"/>
+      </filter>
+
+      <filter id="glow" x="110" y="120" width="780" height="780" filterUnits="userSpaceOnUse" color-interpolation-filters="sRGB">
+        <feGaussianBlur stdDeviation="20" result="blur"/>
+        <feColorMatrix in="blur" type="matrix" values="
+          0 0 0 0 0.156
+          0 0 0 0 0.392
+          0 0 0 0 0.922
+          0 0 0 .38 0"/>
+        <feBlend in2="SourceGraphic" mode="screen"/>
+      </filter>
+
+      <clipPath id="roundClip">
+        <rect x="242" y="190" width="540" height="640" rx="86"/>
+      </clipPath>
+    </defs>
+
+    <!-- transparent background intentionally left empty -->
+
+    <!-- soft brand glow -->
+    <circle cx="512" cy="512" r="370" fill="url(#bgGrad)" opacity="0.13"/>
+
+    <g filter="url(#softShadow)">
+      <!-- rear floating template sheets -->
+      <g opacity="0.92">
+        <rect x="202" y="208" width="275" height="330" rx="42" transform="rotate(-9 202 208)" fill="url(#paperGrad)" stroke="#93C5FD" stroke-width="8"/>
+        <rect x="255" y="273" width="118" height="82" rx="16" transform="rotate(-9 255 273)" fill="#DBEAFE" stroke="#60A5FA" stroke-width="7"/>
+        <path d="M266 342L308 292L342 323L363 299L407 350" transform="rotate(-9 266 342)" fill="#2563EB" opacity="0.9"/>
+        <rect x="388" y="267" width="72" height="15" rx="7.5" transform="rotate(-9 388 267)" fill="#93A4B8"/>
+        <rect x="385" y="305" width="92" height="15" rx="7.5" transform="rotate(-9 385 305)" fill="#CBD5E1"/>
+        <rect x="268" y="409" width="174" height="16" rx="8" transform="rotate(-9 268 409)" fill="#CBD5E1"/>
+        <rect x="271" y="453" width="132" height="14" rx="7" transform="rotate(-9 271 453)" fill="#CBD5E1"/>
+      </g>
+
+      <g opacity="0.92">
+        <rect x="566" y="160" width="286" height="335" rx="42" transform="rotate(8 566 160)" fill="url(#paperGrad)" stroke="#93C5FD" stroke-width="8"/>
+        <rect x="622" y="230" width="130" height="86" rx="16" transform="rotate(8 622 230)" fill="#1D4ED8"/>
+        <path d="M672 252L672 302L717 277L672 252Z" transform="rotate(8 672 252)" fill="white"/>
+        <rect x="764" y="243" width="72" height="15" rx="7.5" transform="rotate(8 764 243)" fill="#93A4B8"/>
+        <rect x="759" y="282" width="92" height="15" rx="7.5" transform="rotate(8 759 282)" fill="#CBD5E1"/>
+        <rect x="758" y="328" width="82" height="34" rx="8" transform="rotate(8 758 328)" fill="#F59E0B"/>
+        <rect x="613" y="380" width="170" height="15" rx="7.5" transform="rotate(8 613 380)" fill="#CBD5E1"/>
+      </g>
+
+      <!-- main app window -->
+      <rect x="238" y="278" width="548" height="486" rx="58" fill="url(#paperGrad)" stroke="#2563EB" stroke-width="10"/>
+      <path d="M238 336C238 304 264 278 296 278H728C760 278 786 304 786 336V390H238V336Z" fill="url(#bgGrad)"/>
+      <circle cx="302" cy="334" r="17" fill="#F43F5E"/>
+      <circle cx="353" cy="334" r="17" fill="#F59E0B"/>
+      <circle cx="404" cy="334" r="17" fill="#22C55E"/>
+
+      <!-- template card inside window -->
+      <rect x="302" y="430" width="274" height="232" rx="26" fill="#F8FBFF" stroke="#94A3B8" stroke-width="8"/>
+      <rect x="334" y="462" width="132" height="92" rx="16" fill="#DBEAFE" stroke="#60A5FA" stroke-width="7"/>
+      <path d="M342 544L391 489L427 525L448 501L478 544H342Z" fill="#2563EB"/>
+      <circle cx="435" cy="488" r="15" fill="white"/>
+
+      <rect x="338" y="590" width="186" height="15" rx="7.5" fill="#94A3B8"/>
+      <rect x="338" y="622" width="138" height="14" rx="7" fill="#CBD5E1"/>
+      <rect x="338" y="653" width="62" height="13" rx="6.5" fill="#CBD5E1"/>
+      <rect x="418" y="653" width="98" height="13" rx="6.5" fill="#CBD5E1"/>
+
+      <!-- generated blocks -->
+      <rect x="616" y="436" width="120" height="44" rx="10" fill="#F59E0B"/>
+      <rect x="616" y="518" width="64" height="36" rx="8" fill="#0EA5E9"/>
+      <rect x="700" y="518" width="64" height="36" rx="8" fill="#22C55E"/>
+      <rect x="616" y="584" width="142" height="14" rx="7" fill="#CBD5E1"/>
+      <rect x="616" y="616" width="102" height="14" rx="7" fill="#CBD5E1"/>
+
+      <!-- circular generation arrow -->
+      <path d="M321 702C415 801 592 827 723 716" stroke="url(#accentGrad)" stroke-width="42" stroke-linecap="round"/>
+      <path d="M736 690L826 687L783 766Z" fill="#8B5CF6"/>
+
+      <!-- magic wand -->
+      <g filter="url(#glow)">
+        <rect x="187" y="649" width="246" height="55" rx="27.5" transform="rotate(-45 187 649)" fill="url(#wandGrad)"/>
+        <rect x="202" y="647" width="90" height="55" rx="27.5" transform="rotate(-45 202 647)" fill="#0F172A" opacity="0.92"/>
+        <rect x="346" y="503" width="72" height="55" rx="27.5" transform="rotate(-45 346 503)" fill="#FBBF24"/>
+      </g>
+
+      <!-- sparkles -->
+      <path d="M214 491L230 532L271 548L230 564L214 605L198 564L157 548L198 532L214 491Z" fill="#FACC15"/>
+      <path d="M151 589L162 617L190 628L162 639L151 667L140 639L112 628L140 617L151 589Z" fill="#38BDF8"/>
+      <path d="M268 544L278 570L304 580L278 590L268 616L258 590L232 580L258 570L268 544Z" fill="#FDE047"/>
+      <path d="M250 429L258 450L279 458L258 466L250 487L242 466L221 458L242 450L250 429Z" fill="#FB923C"/>
+    </g>
+
+    <!-- subtle outer highlight -->
+    <rect x="238" y="278" width="548" height="486" rx="58" stroke="white" stroke-opacity="0.45" stroke-width="4"/>
+  </svg>
+</svg>
