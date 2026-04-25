@@ -176,39 +176,79 @@ async fn run_scaffold(app: AppHandle, payload: RunPayload) -> Result<i32, String
 }
 
 /// macOS / Linux GUI apps launched from Finder/Dock get a stripped PATH
-/// (`/usr/bin:/bin:/usr/sbin:/sbin`). Source the user's login shell once so
-/// node installed via Homebrew / nvm / volta / asdf / fnm is reachable for
-/// every subsequent `Command::new("node")`.
+/// (`/usr/bin:/bin:/usr/sbin:/sbin`). Hydrate it so node installed via
+/// Homebrew / nvm / volta / asdf / fnm is reachable for every subsequent
+/// `Command::new("node")`. Combines an interactive-login shell probe (picks
+/// up `.zshrc` / `.bashrc` setup) with static fallbacks for common managers.
 #[cfg(unix)]
 fn hydrate_user_path() {
-    let already_hydrated = std::env::var("PATH")
-        .map(|p| {
-            p.contains("/opt/homebrew/bin")
-                || p.contains("/usr/local/bin")
-                || p.contains(".nvm/")
-                || p.contains(".volta/")
-                || p.contains(".asdf/")
-                || p.contains(".fnm/")
-        })
-        .unwrap_or(false);
-    if already_hydrated {
-        return;
+    use std::collections::HashSet;
+
+    let home = std::env::var("HOME").unwrap_or_default();
+    let mut entries: Vec<String> = std::env::var("PATH")
+        .unwrap_or_default()
+        .split(':')
+        .filter(|s| !s.is_empty())
+        .map(String::from)
+        .collect();
+    let mut seen: HashSet<String> = entries.iter().cloned().collect();
+    let push = |p: String, entries: &mut Vec<String>, seen: &mut HashSet<String>| {
+        if !p.is_empty() && seen.insert(p.clone()) {
+            entries.push(p);
+        }
+    };
+
+    // Source the user's interactive login shell so nvm/fnm hooks declared in
+    // .zshrc/.bashrc are picked up — `-l` alone only reads .zprofile.
+    let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".into());
+    if let Ok(out) = std::process::Command::new(&shell)
+        .args(["-ilc", "printf %s \"$PATH\""])
+        .output()
+    {
+        if out.status.success() {
+            for entry in String::from_utf8_lossy(&out.stdout).split(':') {
+                push(entry.to_string(), &mut entries, &mut seen);
+            }
+        }
     }
 
-    let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".into());
-    let Ok(out) = std::process::Command::new(&shell)
-        .args(["-l", "-c", "printf %s \"$PATH\""])
-        .output()
-    else {
-        return;
-    };
-    if !out.status.success() {
-        return;
+    // Static fallbacks for the common Node install locations.
+    let mut extras = vec![
+        "/opt/homebrew/bin".to_string(),
+        "/usr/local/bin".to_string(),
+        format!("{home}/.volta/bin"),
+        format!("{home}/.local/bin"),
+        format!("{home}/.cargo/bin"),
+    ];
+    // Latest nvm-installed node version.
+    if let Ok(read) = std::fs::read_dir(format!("{home}/.nvm/versions/node")) {
+        let mut versions: Vec<_> = read
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| p.is_dir())
+            .collect();
+        versions.sort();
+        if let Some(latest) = versions.last() {
+            extras.push(format!("{}/bin", latest.display()));
+        }
     }
-    let path = String::from_utf8_lossy(&out.stdout).trim().to_string();
-    if !path.is_empty() {
-        std::env::set_var("PATH", path);
+    // Latest fnm-installed node version.
+    if let Ok(read) = std::fs::read_dir(format!("{home}/.local/share/fnm/node-versions")) {
+        let mut versions: Vec<_> = read
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| p.is_dir())
+            .collect();
+        versions.sort();
+        if let Some(latest) = versions.last() {
+            extras.push(format!("{}/installation/bin", latest.display()));
+        }
     }
+    for e in extras {
+        push(e, &mut entries, &mut seen);
+    }
+
+    std::env::set_var("PATH", entries.join(":"));
 }
 
 /// Set the macOS Dock icon at runtime so dev mode (which doesn't run inside a
