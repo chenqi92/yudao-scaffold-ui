@@ -166,6 +166,31 @@ async fn load_meta(
 }
 
 #[tauri::command]
+async fn path_exists(path: String) -> bool {
+    tokio::fs::metadata(&path).await.is_ok()
+}
+
+/// Reveal a directory in the platform's native file manager. Plain
+/// `tauri-plugin-shell::open` rejects local paths because its default scope
+/// only matches URLs.
+#[tauri::command]
+async fn reveal_in_finder(path: String) -> Result<(), String> {
+    use std::process::Command as StdCommand;
+    let result = if cfg!(target_os = "macos") {
+        StdCommand::new("open").arg(&path).status()
+    } else if cfg!(target_os = "windows") {
+        StdCommand::new("explorer").arg(&path).status()
+    } else {
+        StdCommand::new("xdg-open").arg(&path).status()
+    };
+    match result {
+        Ok(s) if s.success() => Ok(()),
+        Ok(s) => Err(format!("打开器返回非零状态: {s}")),
+        Err(e) => Err(format!("调用打开器失败: {e}")),
+    }
+}
+
+#[tauri::command]
 async fn run_scaffold(app: AppHandle, payload: RunPayload) -> Result<i32, String> {
     let stdin = serde_json::to_string(&payload).map_err(|e| e.to_string())?;
     let res = run_engine_script(&app, "bin/run.ts", vec![], Some(stdin), true).await?;
@@ -283,7 +308,12 @@ pub fn run() {
             apply_macos_dock_icon();
             Ok(())
         })
-        .invoke_handler(tauri::generate_handler![load_meta, run_scaffold])
+        .invoke_handler(tauri::generate_handler![
+            load_meta,
+            run_scaffold,
+            path_exists,
+            reveal_in_finder
+        ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }

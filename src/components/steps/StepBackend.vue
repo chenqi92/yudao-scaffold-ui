@@ -27,6 +27,18 @@ const { form, setMicroservicePort, moduleSubName } = useScaffold();
         <span class="field-help" style="margin-left: 12px">AI 模块仅 JDK 17 支持</span>
       </el-form-item>
 
+      <el-form-item label="多租户">
+        <el-switch
+          v-model="form.tenantEnabled"
+          active-text="启用"
+          inactive-text="禁用"
+        />
+        <div class="field-help">
+          关闭后会设 <code>yudao.tenant.enable=false</code>，并删除租户管理表/菜单/前端页面。
+          新业务表无需 <code>tenant_id</code> 列、无需 <code>@TenantIgnore</code> 注解。
+        </div>
+      </el-form-item>
+
       <div class="group-title">服务端口</div>
 
       <template v-if="form.backend === 'monolith'">
@@ -128,5 +140,13 @@ const { form, setMicroservicePort, moduleSubName } = useScaffold();
 
 .port-grid :deep(.el-input-number) {
   max-width: 200px;
+}
+
+code {
+  background: var(--surface-2);
+  padding: 1px 6px;
+  border-radius: var(--radius-sm);
+  font-family: 'SF Mono', Monaco, Consolas, monospace;
+  font-size: 12px;
 }
 </style>

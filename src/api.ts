@@ -1,7 +1,6 @@
 import { invoke } from '@tauri-apps/api/core';
 import { listen, type UnlistenFn } from '@tauri-apps/api/event';
 import { open } from '@tauri-apps/plugin-dialog';
-import { open as openShell } from '@tauri-apps/plugin-shell';
 import type { RunPayload, ScaffoldEvent, ScaffoldMeta } from './types';
 
 /**
@@ -42,7 +41,12 @@ export async function pickDirectory(initial?: string): Promise<string | null> {
 
 /** Reveal a directory in the system file manager (Finder / Explorer). */
 export async function revealInFinder(path: string): Promise<void> {
-  await openShell(path);
+  await invoke('reveal_in_finder', { path });
+}
+
+/** Whether the given absolute path currently exists on disk. */
+export async function pathExists(path: string): Promise<boolean> {
+  return invoke<boolean>('path_exists', { path });
 }
 
 export interface RunHandle {

@@ -79,6 +79,10 @@ export interface ScaffoldAnswers {
   superAdminUsername: string;
   superAdminPassword: string;
   pullExisting: boolean;
+  /** When true, an existing output directory will be removed before generation. */
+  force?: boolean;
+  /** When false, set yudao.tenant.enable=false and strip tenant management UI/SQL. */
+  tenantEnabled: boolean;
 }
 
 export interface RunPayload {

@@ -1,6 +1,6 @@
 import { computed, reactive, ref, watch } from 'vue';
 import { ElMessage, ElMessageBox } from 'element-plus';
-import { formatError, loadMeta, pickDirectory, startScaffold } from '../api';
+import { formatError, loadMeta, pathExists, pickDirectory, startScaffold } from '../api';
 import type {
   BackendKind,
   FrontendId,
@@ -53,7 +53,8 @@ const form = reactive<ScaffoldAnswers>({
   microservicePorts: {},
   superAdminUsername: 'admin',
   superAdminPassword: 'admin123',
-  pullExisting: true
+  pullExisting: true,
+  tenantEnabled: true
 });
 
 const settings = reactive({
@@ -274,12 +275,33 @@ function appendLog(e: ScaffoldEvent): void {
 
 async function runScaffold(): Promise<void> {
   if (running.value) return;
+
+  let force = false;
+  if (form.outputDir && (await pathExists(form.outputDir))) {
+    try {
+      await ElMessageBox.confirm(
+        `输出目录已存在：\n${form.outputDir}\n\n继续将删除该目录的全部内容并重新生成，此操作不可撤销。`,
+        '确认强制覆盖',
+        {
+          type: 'warning',
+          confirmButtonText: '强制覆盖',
+          cancelButtonText: '取消',
+          confirmButtonClass: 'el-button--danger',
+          dangerouslyUseHTMLString: false
+        }
+      );
+      force = true;
+    } catch {
+      return;
+    }
+  }
+
   logs.value = [];
   phase.value = null;
   finished.value = null;
   running.value = true;
   const payload: RunPayload = {
-    answers: { ...form },
+    answers: { ...form, force },
     workspace: settings.workspaceOverride || undefined,
     mirror: settings.mirror,
     urlOverrides: settings.urlOverrides.reduce<Record<string, string>>((acc, o) => {

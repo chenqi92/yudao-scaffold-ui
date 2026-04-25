@@ -85,6 +85,12 @@ const backendTpl = computed(() => templateStatus(backendTemplateName()));
       <dt>超管</dt>
       <dd>{{ form.superAdminUsername }} / {{ '*'.repeat(form.superAdminPassword.length) }}</dd>
 
+      <dt>多租户</dt>
+      <dd>
+        <el-tag v-if="form.tenantEnabled" type="info" effect="plain">启用</el-tag>
+        <el-tag v-else type="warning" effect="plain">禁用 (清理租户管理代码)</el-tag>
+      </dd>
+
       <dt>SQL 裁剪</dt>
       <dd>{{ form.sqlFilter ? '是' : '否' }}</dd>
 
