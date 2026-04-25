@@ -6,6 +6,8 @@ export type FrontendId =
   | 'admin-vue3' | 'admin-vben' | 'admin-vue2' | 'admin-uniapp'
   | 'mall-uniapp' | 'go-view';
 
+export type VbenVariant = 'antd' | 'antdv-next' | 'ele' | 'naive' | 'tdesign';
+
 export type FrontendRole = 'admin' | 'mall' | 'dashboard';
 
 export type Mirror = 'gitee' | 'github';
@@ -83,6 +85,8 @@ export interface ScaffoldAnswers {
   force?: boolean;
   /** When false, set yudao.tenant.enable=false and strip tenant management UI/SQL. */
   tenantEnabled: boolean;
+  /** When admin-vben is chosen, which UI library variant to keep (antd / ele / naive / ...). */
+  vbenVariant?: VbenVariant;
 }
 
 export interface RunPayload {

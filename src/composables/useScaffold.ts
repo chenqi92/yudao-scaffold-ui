@@ -54,7 +54,8 @@ const form = reactive<ScaffoldAnswers>({
   superAdminUsername: 'admin',
   superAdminPassword: 'admin123',
   pullExisting: true,
-  tenantEnabled: true
+  tenantEnabled: true,
+  vbenVariant: 'antd'
 });
 
 const settings = reactive({

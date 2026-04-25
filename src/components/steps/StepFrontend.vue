@@ -46,6 +46,20 @@ const {
       />
     </div>
 
+    <div v-if="adminPick === 'admin-vben'" class="vben-variant">
+      <div class="vben-variant-header">
+        <span class="label">vben UI 变体</span>
+        <span class="hint">vben monorepo 含 5 套 UI，仅保留所选变体（其余删除以减小体积）</span>
+      </div>
+      <el-radio-group v-model="form.vbenVariant" size="default">
+        <el-radio-button value="antd">Ant Design Vue</el-radio-button>
+        <el-radio-button value="ele">Element Plus</el-radio-button>
+        <el-radio-button value="naive">Naive UI</el-radio-button>
+        <el-radio-button value="tdesign">TDesign</el-radio-button>
+        <el-radio-button value="antdv-next">Ant Design Next</el-radio-button>
+      </el-radio-group>
+    </div>
+
     <div class="group-title">其它前端 · 多选</div>
     <div class="other-list">
       <label
@@ -124,6 +138,35 @@ const {
   display: grid;
   grid-template-columns: repeat(auto-fill, minmax(260px, 1fr));
   gap: 12px;
+}
+
+.vben-variant {
+  margin-top: 14px;
+  padding: 14px 16px;
+  background: var(--primary-soft);
+  border: 1px solid var(--primary-soft-border);
+  border-radius: var(--radius-md);
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.vben-variant-header {
+  display: flex;
+  align-items: baseline;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+
+.vben-variant-header .label {
+  font-weight: 600;
+  font-size: 13px;
+  color: var(--primary-active);
+}
+
+.vben-variant-header .hint {
+  font-size: 12px;
+  color: var(--text-muted);
 }
 
 .other-list {

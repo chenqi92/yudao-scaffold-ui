@@ -65,6 +65,11 @@ const backendTpl = computed(() => templateStatus(backendTemplateName()));
       <dd class="tags">
         <template v-if="form.frontends.length">
           <el-tag v-for="id in form.frontends" :key="id" effect="plain">{{ id }}</el-tag>
+          <el-tag
+            v-if="form.frontends.includes('admin-vben')"
+            type="info"
+            effect="plain"
+          >vben/{{ form.vbenVariant }}</el-tag>
         </template>
         <span v-else class="muted">(无)</span>
       </dd>
