@@ -99,8 +99,8 @@ const backendTpl = computed(() => templateStatus(backendTemplateName()));
       <dt>SQL 裁剪</dt>
       <dd>{{ form.sqlFilter ? '是' : '否' }}</dd>
 
-      <dt>git pull</dt>
-      <dd>{{ form.pullExisting ? '是' : '否' }}</dd>
+      <dt>模板缓存</dt>
+      <dd>{{ form.pullExisting ? '优先使用' : '重新下载' }}</dd>
 
       <dt>镜像</dt>
       <dd>{{ settings.mirror }}</dd>

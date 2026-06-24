@@ -24,7 +24,7 @@ const {
   <section class="step-section">
     <header class="step-header">
       <h2>前端 + 模板源</h2>
-      <p>选择管理后台 (单选) 与其它前端 (多选)，并配置模板镜像与 URL 覆盖。</p>
+      <p>选择管理后台 (单选) 与其它前端 (多选)，并配置模板下载镜像与 URL 覆盖。</p>
     </header>
 
     <div class="group-title">管理后台 · 单选</div>
@@ -100,18 +100,18 @@ const {
         </DirPicker>
       </el-form-item>
 
-      <el-form-item label="Clone 镜像">
+      <el-form-item label="模板镜像">
         <el-radio-group v-model="settings.mirror">
           <el-radio-button value="gitee">Gitee</el-radio-button>
           <el-radio-button value="github">GitHub</el-radio-button>
         </el-radio-group>
-        <span class="field-help" style="margin-left: 12px">仅在本地与缓存均无源时使用</span>
+        <span class="field-help" style="margin-left: 12px">仅在本地与缓存均无模板时使用</span>
       </el-form-item>
 
-      <el-form-item label="本地 git pull">
+      <el-form-item label="模板缓存">
         <el-switch
           v-model="form.pullExisting"
-          active-text="复制前对本地 git 仓库执行 pull --ff-only"
+          active-text="优先使用已下载缓存，未缓存时自动下载"
         />
       </el-form-item>
 
@@ -123,7 +123,7 @@ const {
             class="override-row"
           >
             <el-input v-model="o.name" placeholder="模板名 (如 ruoyi-vue-pro)" />
-            <el-input v-model="o.url" placeholder="git URL" class="url" />
+            <el-input v-model="o.url" placeholder="GitHub/Gitee 仓库 URL 或 zip URL" class="url" />
             <el-button type="danger" plain @click="removeOverride(idx)">删除</el-button>
           </div>
           <el-button @click="addOverride">+ 增加覆盖</el-button>

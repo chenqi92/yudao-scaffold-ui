@@ -1,6 +1,6 @@
 # yudao-scaffold-ui
 
-Tauri 2 + Vue 3 + Element Plus 桌面壳，包裹 [yudao-scaffold](../yudao-scaffold) 引擎，提供页面式交互体验。
+Tauri 2 + Vue 3 + Element Plus 桌面应用，内置脚手架引擎，提供页面式交互体验。用户下载安装包后可直接启动，不需要额外配置引擎目录、Node 或 Git。
 
 ## 一句话架构
 
@@ -13,24 +13,23 @@ Tauri 2 + Vue 3 + Element Plus 桌面壳，包裹 [yudao-scaffold](../yudao-scaf
 └──────────────┬──────────────────────┘
                │ invoke / events
 ┌──────────────┴──────────────────────┐
-│  Tauri Rust 命令 (~150 行)          │  ← src-tauri/src/lib.rs
-│  - load_meta:   spawn bin/meta.ts   │
-│  - run_scaffold:spawn bin/run.ts    │
-│    解析 \x01-prefixed NDJSON 事件   │
-│    通过 emit 转发到前端             │
+│  Tauri Rust 内置引擎                │  ← src-tauri/src/
+│  - load_meta:   返回内置模块/模板元数据 │
+│  - run_scaffold:下载/缓存/展开模板   │
+│    通过 emit 转发进度到前端          │
 └──────────────┬──────────────────────┘
-               │ JSON_EVENTS=1, stdin/stdout
+               │ HTTPS zip 下载 + 本地缓存
 ┌──────────────┴──────────────────────┐
-│  yudao-scaffold (Node + tsx 引擎)   │
-│  - bin/meta.ts:    元数据 dump       │
-│  - bin/run.ts:     headless 执行     │
-│  - 与 CLI 共用 1700 行生成器代码    │
+│  官方公开模板仓库                    │
+│  - ruoyi-vue-pro / yudao-cloud       │
+│  - yudao-ui-admin-* / mall / go-view │
+│  - 缓存到 ~/.yudao-scaffold-ui       │
 └─────────────────────────────────────┘
 ```
 
 ## 开发
 
-需要：Node 18+、pnpm、Rust 1.77+、对应平台的系统 webview（macOS/Windows 自带，Linux 需要 webkit2gtk）。
+开发需要：Node 18+、pnpm、Rust 1.77+、对应平台的系统 webview（macOS/Windows 自带，Linux 需要 webkit2gtk）。这些只用于开发和打包；安装包用户不需要安装 Node、pnpm、Rust 或 Git。
 
 ```bash
 cd yudao-scaffold-ui
@@ -38,9 +37,7 @@ pnpm install                          # 装 Vue/Element Plus/Tauri JS deps
 pnpm tauri:dev                        # 启动 Vite + 编译 Rust + 弹出窗口
 ```
 
-第一次跑要 5–10 分钟（Rust 全量编译 + 下载 ~250 个 crate）。后续增量编译只要几秒。
-
-引擎位置在 dev 模式下从 `CARGO_MANIFEST_DIR/../../yudao-scaffold` 推断，可通过 `YUDAO_SCAFFOLD_ENGINE=/abs/path` 覆盖。
+第一次跑要 5–10 分钟（Rust 全量编译 + 下载 crates）。后续增量编译只要几秒。
 
 ## 打包发布
 
@@ -61,20 +58,21 @@ pnpm tauri:build
 |---|---|
 | `src/App.vue` | 全部 UI：4 步 stepper、模块卡片、前端复选、镜像配置、执行进度 |
 | `src/api.ts` | Tauri invoke 封装 (`loadMeta` / `pickDirectory` / `startScaffold`) |
-| `src/types.ts` | TS 类型定义，与 yudao-scaffold 引擎保持一致 |
-| `src-tauri/src/lib.rs` | Rust 命令、Node 子进程编排、NDJSON → Tauri event 转发 |
+| `src/types.ts` | TS 类型定义，与 Rust 内置引擎保持一致 |
+| `src-tauri/src/lib.rs` | Tauri 启动、命令注册和平台集成 |
+| `src-tauri/src/scaffold.rs` | 内置脚手架引擎、模板下载缓存、解压复制和事件转发 |
 | `src-tauri/tauri.conf.json` | 窗口尺寸、bundle id、icon 配置 |
 | `src-tauri/capabilities/default.json` | dialog/shell/event 权限白名单 |
 
 ## 运行时数据流
 
 1. **窗口启动 → onMounted**：调用 `load_meta` Tauri 命令
-2. Rust 端 `spawn node --import tsx bin/meta.ts`，捕获 stdout JSON
-3. Vue 用元数据填充模块卡片、前端列表、各模板的"本地/缓存/需 clone"状态
+2. Rust 内置引擎直接返回模块、前端、模板源和缓存状态
+3. Vue 用元数据填充模块卡片、前端列表、各模板的"本地/缓存/可下载"状态
 4. **用户在 4 个 step 里填表 → 点"开始生成"**
 5. Vue 调 `run_scaffold(payload)`，并预先 `listen('scaffold-event', ...)` 注册回调
-6. Rust 端 `spawn node ... bin/run.ts`，把 payload 写到 stdin，**`JSON_EVENTS=1`** 让引擎在每行 stdout 前加 `\x01` 控制字符再 emit
-7. Rust 异步逐行读 stdout：以 `\x01` 开头的剥前缀解析为 JSON event → `app.emit('scaffold-event', ...)` 转发到前端
+6. Rust 内置引擎按需下载模板 zip、解压到本地缓存，并复制到输出目录
+7. Rust 端通过 `app.emit('scaffold-event', ...)` 实时转发阶段、日志和完成事件
 8. Vue 收到事件 → 进度条、日志面板实时更新
 
 ## 浏览器模式（无 Tauri）

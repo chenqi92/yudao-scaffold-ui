@@ -20,7 +20,7 @@ const label = computed(() => {
   switch (state.value) {
     case 'local': return '本地';
     case 'cache': return '缓存';
-    case 'remote': return '需 clone';
+    case 'remote': return '可下载';
     default: return '未知';
   }
 });
