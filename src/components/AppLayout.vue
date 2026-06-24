@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { useScaffold } from '../composables/useScaffold';
 
-const { loading } = useScaffold();
+const { loading, loadError, refreshMeta } = useScaffold();
 </script>
 
 <template>
@@ -11,6 +11,21 @@ const { loading } = useScaffold();
     </aside>
     <div class="app-main">
       <main class="app-content scrollbar-thin">
+        <el-alert
+          v-if="loadError"
+          class="load-error"
+          type="error"
+          :closable="false"
+          show-icon
+        >
+          <template #title>加载脚手架引擎失败</template>
+          <template #default>
+            <div class="load-error-body">
+              <span>{{ loadError }}</span>
+              <el-button size="small" type="danger" plain @click="refreshMeta">重新加载</el-button>
+            </div>
+          </template>
+        </el-alert>
         <slot />
       </main>
       <footer class="app-actionbar">
@@ -58,6 +73,22 @@ const { loading } = useScaffold();
   max-width: 960px;
   width: 100%;
   margin: 0 auto;
+}
+
+.load-error {
+  flex-shrink: 0;
+}
+
+.load-error-body {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  justify-content: space-between;
+}
+
+.load-error-body span {
+  min-width: 0;
+  overflow-wrap: anywhere;
 }
 
 .app-actionbar {

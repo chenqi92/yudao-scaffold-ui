@@ -1,35 +1,47 @@
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::process::Stdio;
+use std::time::Duration;
 use tauri::{AppHandle, Emitter, Manager};
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command;
+use tokio::time::timeout;
 
 /// Resolve the engine root directory (yudao-scaffold/).
 ///
 /// In dev: derived from CARGO_MANIFEST_DIR (../../yudao-scaffold).
 /// In release: a sibling `yudao-scaffold/` next to the bundled app, or via
 /// the YUDAO_SCAFFOLD_ENGINE env var override.
-fn engine_dir(app: &AppHandle) -> PathBuf {
+fn engine_dir(app: &AppHandle) -> Result<PathBuf, String> {
     if let Ok(p) = std::env::var("YUDAO_SCAFFOLD_ENGINE") {
-        return PathBuf::from(p);
+        let dir = PathBuf::from(p);
+        if dir.exists() {
+            return Ok(dir);
+        }
+        return Err(format!(
+            "YUDAO_SCAFFOLD_ENGINE 指向的引擎目录不存在: {}",
+            dir.display()
+        ));
     }
     // Dev mode — assume the workspace layout
     let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let candidate = manifest.parent().and_then(|p| p.parent()).map(|p| p.join("yudao-scaffold"));
+    let candidate = manifest
+        .parent()
+        .and_then(|p| p.parent())
+        .map(|p| p.join("yudao-scaffold"));
     if let Some(dir) = candidate {
         if dir.exists() {
-            return dir;
+            return Ok(dir);
         }
     }
     // Production fallback: look next to the executable
     if let Ok(exe) = app.path().resource_dir() {
         let p = exe.join("yudao-scaffold");
         if p.exists() {
-            return p;
+            return Ok(p);
         }
     }
-    panic!("无法定位 yudao-scaffold 引擎目录。请设置 YUDAO_SCAFFOLD_ENGINE 环境变量。")
+    Err("无法定位 yudao-scaffold 引擎目录。请确认安装包包含 yudao-scaffold 资源目录，或设置 YUDAO_SCAFFOLD_ENGINE 环境变量。".to_string())
 }
 
 /// Pick the node binary. Honors NODE_BIN, falls back to PATH lookup.
@@ -45,7 +57,7 @@ async fn run_engine_script(
     stdin_payload: Option<String>,
     json_events: bool,
 ) -> Result<EngineResult, String> {
-    let dir = engine_dir(app);
+    let dir = engine_dir(app)?;
     let script = dir.join(script_rel);
     if !script.exists() {
         return Err(format!("引擎脚本不存在: {}", script.display()));
@@ -82,53 +94,56 @@ async fn run_engine_script(
         }
     }
 
-    let stdout = child.stdout.take().expect("stdout piped");
-    let stderr = child.stderr.take().expect("stderr piped");
-    let mut out_reader = BufReader::new(stdout).lines();
-    let mut err_reader = BufReader::new(stderr).lines();
+    let mut out_reader = BufReader::new(child.stdout.take().expect("stdout piped")).lines();
+    let mut err_reader = BufReader::new(child.stderr.take().expect("stderr piped")).lines();
 
     let app_clone = app.clone();
-    let mut full_stdout = String::new();
-    let mut full_stderr = String::new();
-
-    loop {
-        tokio::select! {
-            line = out_reader.next_line() => {
-                match line {
-                    Ok(Some(l)) => {
-                        if json_events {
-                            // Each event line is prefixed with the SOH byte so we can split it from
-                            // human log output going to the same stdout.
-                            if let Some(stripped) = l.strip_prefix('\u{0001}') {
-                                if let Ok(evt) = serde_json::from_str::<serde_json::Value>(stripped) {
-                                    let _ = app_clone.emit("scaffold-event", evt);
-                                    continue;
-                                }
-                            }
-                        }
-                        full_stdout.push_str(&l);
-                        full_stdout.push('\n');
+    let stdout_task = tokio::spawn(async move {
+        let mut full_stdout = String::new();
+        while let Some(l) = out_reader
+            .next_line()
+            .await
+            .map_err(|e| format!("stdout 读取失败: {e}"))?
+        {
+            if json_events {
+                // Each event line is prefixed with the SOH byte so we can split it from
+                // human log output going to the same stdout.
+                if let Some(stripped) = l.strip_prefix('\u{0001}') {
+                    if let Ok(evt) = serde_json::from_str::<serde_json::Value>(stripped) {
+                        let _ = app_clone.emit("scaffold-event", evt);
+                        continue;
                     }
-                    Ok(None) => break,
-                    Err(e) => return Err(format!("stdout 读取失败: {e}")),
                 }
             }
-            line = err_reader.next_line() => {
-                if let Ok(Some(l)) = line {
-                    full_stderr.push_str(&l);
-                    full_stderr.push('\n');
-                }
-            }
+            full_stdout.push_str(&l);
+            full_stdout.push('\n');
         }
-    }
+        Ok::<_, String>(full_stdout)
+    });
 
-    // drain any remaining stderr
-    while let Ok(Some(l)) = err_reader.next_line().await {
-        full_stderr.push_str(&l);
-        full_stderr.push('\n');
-    }
+    let stderr_task = tokio::spawn(async move {
+        let mut full_stderr = String::new();
+        while let Some(l) = err_reader
+            .next_line()
+            .await
+            .map_err(|e| format!("stderr 读取失败: {e}"))?
+        {
+            full_stderr.push_str(&l);
+            full_stderr.push('\n');
+        }
+        Ok::<_, String>(full_stderr)
+    });
 
-    let status = child.wait().await.map_err(|e| format!("等待子进程失败: {e}"))?;
+    let status = child
+        .wait()
+        .await
+        .map_err(|e| format!("等待子进程失败: {e}"))?;
+    let full_stdout = stdout_task
+        .await
+        .map_err(|e| format!("stdout 任务失败: {e}"))??;
+    let full_stderr = stderr_task
+        .await
+        .map_err(|e| format!("stderr 任务失败: {e}"))??;
     Ok(EngineResult {
         code: status.code().unwrap_or(-1),
         stdout: full_stdout,
@@ -152,14 +167,20 @@ struct RunPayload {
 }
 
 #[tauri::command]
-async fn load_meta(
-    app: AppHandle,
-    workspace: Option<String>,
-) -> Result<serde_json::Value, String> {
+async fn load_meta(app: AppHandle, workspace: Option<String>) -> Result<serde_json::Value, String> {
     let args = workspace.into_iter().collect::<Vec<_>>();
-    let res = run_engine_script(&app, "bin/meta.ts", args, None, false).await?;
+    let res = timeout(
+        Duration::from_secs(20),
+        run_engine_script(&app, "bin/meta.ts", args, None, false),
+    )
+    .await
+    .map_err(|_| "加载元数据超时，请检查 yudao-scaffold 引擎是否可用。".to_string())??;
     if res.code != 0 {
-        return Err(format!("meta.ts 退出码 {}: {}", res.code, res.stderr.trim()));
+        return Err(format!(
+            "meta.ts 退出码 {}: {}",
+            res.code,
+            res.stderr.trim()
+        ));
     }
     serde_json::from_str(&res.stdout)
         .map_err(|e| format!("解析 meta JSON 失败: {e}\n原文: {}", &res.stdout))
@@ -287,7 +308,9 @@ fn apply_macos_dock_icon() {
 
     const ICON_BYTES: &[u8] = include_bytes!("../icons/icon.icns");
 
-    let Some(mtm) = MainThreadMarker::new() else { return };
+    let Some(mtm) = MainThreadMarker::new() else {
+        return;
+    };
     let ns_data = NSData::with_bytes(ICON_BYTES);
     let Some(image) = NSImage::initWithData(NSImage::alloc(), &ns_data) else {
         return;

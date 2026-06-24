@@ -33,6 +33,7 @@ export interface FinishedState {
 
 const meta = ref<ScaffoldMeta | null>(null);
 const loading = ref(true);
+const loadError = ref('');
 const activeStep = ref(0);
 
 const form = reactive<ScaffoldAnswers>({
@@ -205,8 +206,10 @@ function setMicroservicePort(id: ModuleId, idx: number, val: number | null): voi
 
 async function refreshMeta(): Promise<void> {
   loading.value = true;
+  loadError.value = '';
   try {
     meta.value = await loadMeta(settings.workspaceOverride || undefined);
+    loadError.value = '';
     settings.mirror = meta.value.defaultMirror;
     if (!form.outputDir && meta.value.workspace) {
       form.outputDir = `${meta.value.workspace}/${form.projectName}`;
@@ -214,7 +217,9 @@ async function refreshMeta(): Promise<void> {
     form.monolithPort = meta.value.defaultMonolithPort;
     form.gatewayPort = meta.value.defaultGatewayPort;
   } catch (e) {
-    ElMessage.error(`加载元数据失败：${formatError(e)}`);
+    const message = formatError(e);
+    loadError.value = message;
+    ElMessage.error(`加载元数据失败：${message}`);
   } finally {
     loading.value = false;
   }
@@ -394,6 +399,7 @@ export function useScaffold() {
     // state
     meta,
     loading,
+    loadError,
     activeStep,
     form,
     settings,
