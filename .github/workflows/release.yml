@@ -2,6 +2,12 @@ name: Release
 
 on:
   workflow_dispatch:
+    inputs:
+      replace_existing:
+        description: Replace assets on an existing release tag
+        required: false
+        type: boolean
+        default: false
   push:
     branches:
       - main
@@ -24,6 +30,7 @@ jobs:
       version: ${{ steps.version.outputs.version }}
       tag: ${{ steps.version.outputs.tag }}
       should_release: ${{ steps.release.outputs.should_release }}
+      replace_existing: ${{ steps.release.outputs.replace_existing }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -57,21 +64,55 @@ jobs:
       - name: Check whether release tag exists
         id: release
         shell: bash
+        env:
+          REPLACE_EXISTING: ${{ github.event_name == 'workflow_dispatch' && inputs.replace_existing == true }}
         run: |
           set -euo pipefail
 
           tag="${{ steps.version.outputs.tag }}"
           if git ls-remote --exit-code --tags origin "refs/tags/$tag" >/dev/null 2>&1; then
-            echo "Release tag $tag already exists; skipping."
-            echo "should_release=false" >> "$GITHUB_OUTPUT"
+            if [[ "$REPLACE_EXISTING" == "true" ]]; then
+              echo "Release tag $tag already exists; replacing assets."
+              echo "should_release=true" >> "$GITHUB_OUTPUT"
+              echo "replace_existing=true" >> "$GITHUB_OUTPUT"
+            else
+              echo "Release tag $tag already exists; skipping."
+              echo "should_release=false" >> "$GITHUB_OUTPUT"
+              echo "replace_existing=false" >> "$GITHUB_OUTPUT"
+            fi
           else
             echo "Release tag $tag does not exist; publishing."
             echo "should_release=true" >> "$GITHUB_OUTPUT"
+            echo "replace_existing=false" >> "$GITHUB_OUTPUT"
           fi
+
+  prepare-release:
+    name: Prepare release assets
+    needs: version
+    if: needs.version.outputs.should_release == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Delete existing assets when replacing
+        if: needs.version.outputs.replace_existing == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ needs.version.outputs.tag }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json assets --jq '.assets[].name' |
+            while IFS= read -r asset; do
+              [[ -z "$asset" ]] && continue
+              echo "Deleting release asset: $asset"
+              gh release delete-asset "$TAG" "$asset" --repo "$GITHUB_REPOSITORY" --yes
+            done
 
   publish:
     name: Build and publish ${{ needs.version.outputs.tag }}
-    needs: version
+    needs:
+      - version
+      - prepare-release
     if: needs.version.outputs.should_release == 'true'
     strategy:
       fail-fast: false
