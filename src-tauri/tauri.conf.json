@@ -32,6 +32,11 @@
     "shortDescription": "Scaffold yudao-based Spring Boot / Cloud projects",
     "longDescription": "Interactive desktop generator for yudao monolith and microservice projects. Picks modules, frontends, prunes templates, renames packages, and writes a ready-to-build project.",
     "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png",
+      "icons/icon.icns",
+      "icons/icon.ico",
       "icons/icon.png"
     ]
   }
