@@ -816,7 +816,7 @@ fn customize_backend_tree(root: &Path, answers: &ScaffoldAnswers) -> Result<usiz
         ("yudao-cloud", answers.project_name.as_str()),
     ];
     rewrite_text_files(root, &replacements)?;
-    set_xml_tag_value(&root.join("pom.xml"), "revision", &answers.version)?;
+    set_maven_revision_properties(root, &answers.version)?;
     relocate_java_packages(root, &answers.base_package)?;
     configure_backend_settings(root, answers)?;
     filter_unselected_module_sql(&root.join("sql"), &answers.modules)
@@ -881,6 +881,16 @@ fn set_xml_tag_value(path: &Path, tag: &str, value: &str) -> Result<(), String> 
     let mut updated = text;
     updated.replace_range(start..end, value);
     fs::write(path, updated).map_err(|e| format!("写入 XML 文件失败 {}: {e}", path.display()))
+}
+
+fn set_maven_revision_properties(root: &Path, version: &str) -> Result<(), String> {
+    for relative in ["pom.xml", "yudao-dependencies/pom.xml"] {
+        let path = root.join(relative);
+        if path.is_file() {
+            set_xml_tag_value(&path, "revision", version)?;
+        }
+    }
+    Ok(())
 }
 
 fn configure_backend_settings(root: &Path, answers: &ScaffoldAnswers) -> Result<(), String> {
@@ -2720,6 +2730,34 @@ mod tests {
     }
 
     #[test]
+    fn keeps_root_and_dependency_bom_revision_in_sync() {
+        let test_root = unique_test_dir();
+        fs::create_dir_all(test_root.join("yudao-dependencies")).unwrap();
+        fs::write(
+            test_root.join("pom.xml"),
+            "<properties><revision>old-root</revision></properties>\n",
+        )
+        .unwrap();
+        fs::write(
+            test_root.join("yudao-dependencies").join("pom.xml"),
+            "<properties><revision>old-bom</revision></properties>\n",
+        )
+        .unwrap();
+
+        set_maven_revision_properties(&test_root, "0.0.1").unwrap();
+
+        assert!(fs::read_to_string(test_root.join("pom.xml"))
+            .unwrap()
+            .contains("<revision>0.0.1</revision>"));
+        assert!(
+            fs::read_to_string(test_root.join("yudao-dependencies").join("pom.xml"))
+                .unwrap()
+                .contains("<revision>0.0.1</revision>")
+        );
+        fs::remove_dir_all(test_root).unwrap();
+    }
+
+    #[test]
     fn relocates_java_packages_without_deleting_cn_targets_or_recursing() {
         for base_package in ["cn.example.app", "cn.iocoder.yudao.child"] {
             let test_root = unique_test_dir();
@@ -3043,6 +3081,9 @@ mod tests {
         assert!(pom.contains("<artifactId>local-audit</artifactId>"));
         assert!(pom.contains("<revision>9.8.7-SNAPSHOT</revision>"));
         assert!(pom.contains("<java.version>17</java.version>"));
+        let dependencies_pom =
+            fs::read_to_string(backend.join("yudao-dependencies").join("pom.xml")).unwrap();
+        assert!(dependencies_pom.contains("<revision>9.8.7-SNAPSHOT</revision>"));
 
         let application = fs::read_to_string(
             backend
@@ -3081,6 +3122,20 @@ mod tests {
             0,
             "SQL filtering must remove every recognizable unselected module seed row"
         );
+        if std::env::var_os("YUDAO_SCAFFOLD_RUN_MAVEN_PACKAGE").is_some() {
+            let maven_command = if cfg!(windows) { "mvn.cmd" } else { "mvn" };
+            let build = std::process::Command::new(maven_command)
+                .current_dir(&backend)
+                .args(["-U", "-DskipTests", "package"])
+                .output()
+                .unwrap();
+            assert!(
+                build.status.success(),
+                "generated Maven project failed to build\nstdout:\n{}\nstderr:\n{}",
+                String::from_utf8_lossy(&build.stdout),
+                String::from_utf8_lossy(&build.stderr)
+            );
+        }
         fs::remove_dir_all(test_root).unwrap();
     }
 
