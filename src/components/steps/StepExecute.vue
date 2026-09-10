@@ -27,6 +27,9 @@ const progressStatus = computed(() => {
 });
 
 const backendTpl = computed(() => templateStatus(backendTemplateName()));
+const backendEntryModule = computed(() =>
+  `${form.artifactId}-${form.backend === 'microservice' ? 'gateway' : 'server'}`
+);
 </script>
 
 <template>
@@ -144,7 +147,7 @@ const backendTpl = computed(() => templateStatus(backendTemplateName()));
     >
       <template #title>项目已生成于 {{ finished.outputDir }}</template>
       目录结构：<code>backend/</code><template v-if="form.frontends.length"> + <code>frontend/</code></template><br />
-      下一步：<code>cd {{ finished.outputDir }}/backend && mvn -pl yudao-server -am package -DskipTests</code>
+      下一步：<code>cd {{ finished.outputDir }}/backend && mvn -pl {{ backendEntryModule }} -am package -DskipTests</code>
     </el-alert>
 
     <el-alert

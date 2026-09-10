@@ -820,7 +820,10 @@ fn customize_backend_tree(root: &Path, answers: &ScaffoldAnswers) -> Result<usiz
     relocate_java_packages(root, &answers.base_package)?;
     configure_backend_settings(root, answers)?;
     prune_unselected_module_configs(root, &answers.modules)?;
-    filter_unselected_module_sql(&root.join("sql"), &answers.modules)
+    let removed_sql_rows = filter_unselected_module_sql(&root.join("sql"), &answers.modules)?;
+    rename_backend_project_identifiers(root, &answers.artifact_id)?;
+    extend_generated_gitignore(root)?;
+    Ok(removed_sql_rows)
 }
 
 fn customize_frontend_tree(
@@ -2034,6 +2037,191 @@ fn relocate_java_packages(root: &Path, base_package: &str) -> Result<(), String>
     Ok(())
 }
 
+fn rename_backend_project_identifiers(root: &Path, artifact_id: &str) -> Result<(), String> {
+    let artifact_id = artifact_id.trim();
+    if !is_valid_artifact_id(artifact_id) {
+        return Err(format!("非法 Maven artifactId: {artifact_id}"));
+    }
+    if artifact_id == "yudao" {
+        return Ok(());
+    }
+
+    let module_prefix = format!("{artifact_id}-");
+    rewrite_text_files(root, &[("yudao-", module_prefix.as_str())])?;
+    rename_application_entrypoints(root, artifact_id)?;
+    rename_prefixed_entries(root, artifact_id)
+}
+
+fn is_valid_artifact_id(value: &str) -> bool {
+    let mut characters = value.chars();
+    matches!(characters.next(), Some('a'..='z'))
+        && characters.all(|character| {
+            character.is_ascii_lowercase() || character.is_ascii_digit() || character == '-'
+        })
+}
+
+fn upper_camel_artifact_id(artifact_id: &str) -> String {
+    artifact_id
+        .split('-')
+        .filter(|part| !part.is_empty())
+        .map(|part| {
+            let mut characters = part.chars();
+            let Some(first) = characters.next() else {
+                return String::new();
+            };
+            format!(
+                "{}{}",
+                first.to_ascii_uppercase(),
+                characters.collect::<String>()
+            )
+        })
+        .collect()
+}
+
+fn rename_application_entrypoints(root: &Path, artifact_id: &str) -> Result<(), String> {
+    let mut entrypoints = Vec::new();
+    collect_application_entrypoints(root, &mut entrypoints)?;
+    let class_prefix = upper_camel_artifact_id(artifact_id);
+    let renames = entrypoints
+        .into_iter()
+        .map(|path| {
+            let old_name = path
+                .file_stem()
+                .and_then(|name| name.to_str())
+                .ok_or_else(|| format!("非法启动类文件名: {}", path.display()))?
+                .to_string();
+            let suffix = old_name
+                .strip_prefix("Yudao")
+                .ok_or_else(|| format!("无法识别启动类: {}", path.display()))?;
+            let new_name = format!("{class_prefix}{suffix}");
+            Ok((path, old_name, new_name))
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    {
+        let replacements = renames
+            .iter()
+            .map(|(_, old_name, new_name)| (old_name.as_str(), new_name.as_str()))
+            .collect::<Vec<_>>();
+        rewrite_text_files(root, &replacements)?;
+    }
+    for (path, _, new_name) in renames {
+        let target = path.with_file_name(format!("{new_name}.java"));
+        if target.exists() {
+            return Err(format!("目标启动类已存在: {}", target.display()));
+        }
+        fs::rename(&path, &target).map_err(|e| {
+            format!(
+                "重命名启动类 {} -> {} 失败: {e}",
+                path.display(),
+                target.display()
+            )
+        })?;
+    }
+    Ok(())
+}
+
+fn collect_application_entrypoints(root: &Path, out: &mut Vec<PathBuf>) -> Result<(), String> {
+    if !root.exists() {
+        return Ok(());
+    }
+    for entry in fs::read_dir(root).map_err(|e| format!("读取启动类目录失败: {e}"))? {
+        let entry = entry.map_err(|e| format!("读取启动类目录项失败: {e}"))?;
+        let path = entry.path();
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if path.is_dir() {
+            if !matches!(name.as_ref(), ".git" | ".idea" | "node_modules" | "target") {
+                collect_application_entrypoints(&path, out)?;
+            }
+        } else if name.starts_with("Yudao") && name.ends_with("Application.java") {
+            out.push(path);
+        }
+    }
+    Ok(())
+}
+
+fn rename_prefixed_entries(root: &Path, artifact_id: &str) -> Result<(), String> {
+    let entries = fs::read_dir(root)
+        .map_err(|e| format!("读取待重命名目录失败: {e}"))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| format!("读取待重命名目录项失败: {e}"))?;
+    for entry in entries {
+        let path = entry.path();
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if path.is_dir() && !matches!(name.as_ref(), ".git" | ".idea" | "node_modules" | "target") {
+            rename_prefixed_entries(&path, artifact_id)?;
+        }
+        if !name.contains("yudao-") {
+            continue;
+        }
+        let renamed = name.replace("yudao-", &format!("{artifact_id}-"));
+        let target = path.with_file_name(renamed);
+        if target.exists() {
+            return Err(format!("目标模块路径已存在: {}", target.display()));
+        }
+        fs::rename(&path, &target).map_err(|e| {
+            format!(
+                "重命名模块路径 {} -> {} 失败: {e}",
+                path.display(),
+                target.display()
+            )
+        })?;
+    }
+    Ok(())
+}
+
+fn extend_generated_gitignore(root: &Path) -> Result<(), String> {
+    let path = root.join(".gitignore");
+    let text = fs::read_to_string(&path)
+        .map_err(|e| format!("读取生成项目 .gitignore 失败 {}: {e}", path.display()))?;
+    let existing = text.lines().map(str::trim).collect::<HashSet<_>>();
+    let required = [
+        "dependency-reduced-pom.xml",
+        "release.properties",
+        "pom.xml.releaseBackup",
+        ".mvn/timing.properties",
+        ".vscode/",
+        ".fleet/",
+        ".history/",
+        "*.code-workspace",
+        "*.class",
+        "*.tmp",
+        "*.temp",
+        "*.bak",
+        "*.orig",
+        "*.rej",
+        "*.pid",
+        "*.hprof",
+        "hs_err_pid*",
+        "replay_pid*",
+        ".attach_pid*",
+        "logs/",
+        "log/",
+        ".env",
+        ".env.*",
+        "!.env.example",
+    ];
+    let missing = required
+        .into_iter()
+        .filter(|rule| !existing.contains(rule))
+        .collect::<Vec<_>>();
+    if missing.is_empty() {
+        return Ok(());
+    }
+    let mut updated = text;
+    if !updated.ends_with('\n') {
+        updated.push('\n');
+    }
+    updated.push_str("\n# Generated project local artifacts\n");
+    for rule in missing {
+        updated.push_str(rule);
+        updated.push('\n');
+    }
+    fs::write(&path, updated)
+        .map_err(|e| format!("写入生成项目 .gitignore 失败 {}: {e}", path.display()))
+}
+
 fn remove_empty_package_ancestors(mut current: Option<&Path>, stop: &Path) -> Result<(), String> {
     while let Some(path) = current {
         if path == stop || !path.starts_with(stop) {
@@ -2098,8 +2286,17 @@ fn write_project_readme(backend_dir: &Path, answers: &ScaffoldAnswers) -> Result
         answers.monolith_port
     }
     .unwrap_or(DEFAULT_MONOLITH_PORT);
+    let entry_module = format!(
+        "{}-{}",
+        answers.artifact_id,
+        if answers.backend == "microservice" {
+            "gateway"
+        } else {
+            "server"
+        }
+    );
     let readme = format!(
-        "# {}\n\n`{}` 是由 yudao-scaffold 生成的 {}后端项目。\n\n## 项目信息\n\n- Maven：`{}:{}:{}`\n- Java 包：`{}`\n- JDK：{}\n- 业务模块：`{}`\n- 服务端口：{}\n- 多租户：{}\n\n## 本地启动\n\n1. 按需调整 `yudao-server/src/main/resources/application-local.yaml` 中的数据库和 Redis。\n2. 导入 `sql/mysql/ruoyi-vue-pro.sql`（或对应数据库方言）。\n3. 执行 `mvn -pl yudao-server -am spring-boot:run`。\n{}",
+        "# {}\n\n`{}` 是由项目脚手架生成的{}后端项目。\n\n## 项目信息\n\n- Maven：`{}:{}:{}`\n- Java 包：`{}`\n- JDK：{}\n- 业务模块：`{}`\n- 服务端口：{}\n- 多租户：{}\n\n## 本地启动\n\n1. 按需调整 `{}/src/main/resources/application-local.yaml` 中的数据库和 Redis。\n2. 导入 `sql/mysql/ruoyi-vue-pro.sql`（或对应数据库方言）。\n3. 执行 `mvn -pl {} -am spring-boot:run`。\n{}",
         answers.display_name,
         answers.project_name,
         if answers.backend == "microservice" { "微服务" } else { "单体" },
@@ -2111,6 +2308,8 @@ fn write_project_readme(backend_dir: &Path, answers: &ScaffoldAnswers) -> Result
         answers.modules.join("`, `"),
         port,
         if answers.tenant_enabled { "启用" } else { "禁用" },
+        entry_module,
+        entry_module,
         sql_note,
     );
     fs::write(backend_dir.join("README.md"), readme)
@@ -2665,6 +2864,7 @@ fn should_rewrite_file(path: &Path) -> bool {
             | "cmd"
             | "bat"
             | "ps1"
+            | "vm"
     )
 }
 
@@ -2956,6 +3156,90 @@ mod tests {
 
             fs::remove_dir_all(test_root).unwrap();
         }
+    }
+
+    #[test]
+    fn renames_generated_maven_modules_entrypoint_and_templates() {
+        let test_root = unique_test_dir();
+        let server_java = test_root.join("yudao-server/src/main/java/com/example/server");
+        let gateway_java = test_root.join("yudao-gateway/src/main/java/com/example/gateway");
+        let velocity = test_root.join("yudao-module-infra/src/main/resources/codegen");
+        fs::create_dir_all(&server_java).unwrap();
+        fs::create_dir_all(&gateway_java).unwrap();
+        fs::create_dir_all(&velocity).unwrap();
+        fs::create_dir_all(test_root.join("yudao-dependencies")).unwrap();
+        fs::create_dir_all(test_root.join("yudao-framework/yudao-common")).unwrap();
+        fs::create_dir_all(test_root.join("yudao-module-system")).unwrap();
+        fs::write(
+            test_root.join("pom.xml"),
+            "<module>yudao-dependencies</module>\n<module>yudao-framework</module>\n<module>yudao-server</module>\n<module>yudao-gateway</module>\n<module>yudao-module-system</module>\n<module>yudao-module-infra</module>\n",
+        )
+        .unwrap();
+        fs::write(
+            gateway_java.join("YudaoGatewayApplication.java"),
+            "public class YudaoGatewayApplication {}\n",
+        )
+        .unwrap();
+        fs::write(
+            server_java.join("YudaoServerApplication.java"),
+            "public class YudaoServerApplication { String module = \"yudao-server\"; }\n",
+        )
+        .unwrap();
+        fs::write(
+            velocity.join("h2.vm"),
+            "copy to yudao-module-${table.moduleName}\n",
+        )
+        .unwrap();
+
+        rename_backend_project_identifiers(&test_root, "polar").unwrap();
+
+        for directory in [
+            "polar-dependencies",
+            "polar-framework/polar-common",
+            "polar-module-system",
+            "polar-module-infra",
+            "polar-server",
+            "polar-gateway",
+        ] {
+            assert!(test_root.join(directory).is_dir(), "missing {directory}");
+        }
+        let main_class = test_root
+            .join("polar-server/src/main/java/com/example/server/PolarServerApplication.java");
+        let main_text = fs::read_to_string(main_class).unwrap();
+        assert!(main_text.contains("class PolarServerApplication"));
+        assert!(main_text.contains("polar-server"));
+        assert!(!main_text.contains("YudaoServerApplication"));
+        assert!(test_root
+            .join("polar-gateway/src/main/java/com/example/gateway/PolarGatewayApplication.java")
+            .is_file());
+        let pom = fs::read_to_string(test_root.join("pom.xml")).unwrap();
+        assert!(pom.contains("<module>polar-dependencies</module>"));
+        assert!(pom.contains("<module>polar-module-infra</module>"));
+        assert!(!pom.contains("yudao-"));
+        let velocity = fs::read_to_string(
+            test_root.join("polar-module-infra/src/main/resources/codegen/h2.vm"),
+        )
+        .unwrap();
+        assert!(velocity.contains("polar-module-${table.moduleName}"));
+        assert!(!velocity.contains("yudao-"));
+        fs::remove_dir_all(test_root).unwrap();
+    }
+
+    #[test]
+    fn extends_generated_gitignore_without_duplicate_rules() {
+        let test_root = unique_test_dir();
+        fs::create_dir_all(&test_root).unwrap();
+        fs::write(test_root.join(".gitignore"), "target/\n.idea\n").unwrap();
+
+        extend_generated_gitignore(&test_root).unwrap();
+        extend_generated_gitignore(&test_root).unwrap();
+
+        let gitignore = fs::read_to_string(test_root.join(".gitignore")).unwrap();
+        for rule in ["logs/", "*.class", ".vscode/", ".env", "!.env.example"] {
+            assert!(gitignore.lines().any(|line| line == rule));
+            assert_eq!(gitignore.lines().filter(|line| *line == rule).count(), 1);
+        }
+        fs::remove_dir_all(test_root).unwrap();
     }
 
     #[test]
@@ -3353,26 +3637,37 @@ mod tests {
             .filter_map(Result::ok)
             .filter(|entry| entry.file_type().map(|kind| kind.is_dir()).unwrap_or(false))
             .map(|entry| entry.file_name().to_string_lossy().into_owned())
-            .filter(|name| name.starts_with("yudao-module-"))
+            .filter(|name| name.starts_with("local-audit-module-"))
             .collect::<HashSet<_>>();
         assert_eq!(
             remaining_modules,
             HashSet::from([
-                "yudao-module-system".to_string(),
-                "yudao-module-infra".to_string()
+                "local-audit-module-system".to_string(),
+                "local-audit-module-infra".to_string()
             ])
         );
-        for unwanted in ["yudao-ui", ".gitee", ".github", ".image"] {
+        for unwanted in [
+            "yudao-ui",
+            "yudao-dependencies",
+            "yudao-framework",
+            "yudao-server",
+            ".gitee",
+            ".github",
+            ".image",
+        ] {
             assert!(!backend.join(unwanted).exists());
         }
         assert!(!backend
-            .join("yudao-module-infra/src/main/java/com/local/audit/module/infra/controller/admin/demo")
+            .join("local-audit-module-infra/src/main/java/com/local/audit/module/infra/controller/admin/demo")
             .exists());
         assert!(!test_root.join(".scaffold.json").exists());
         assert!(!test_root.join("README.scaffold.md").exists());
         assert!(fs::read_to_string(backend.join("README.md"))
             .unwrap()
             .starts_with("# Local Audit"));
+        assert!(fs::read_to_string(backend.join("README.md"))
+            .unwrap()
+            .contains("mvn -pl local-audit-server -am spring-boot:run"));
         assert!(!test_root.join(".git").exists());
         assert!(backend.join(".git").join("HEAD").is_file());
         let git_config = fs::read_to_string(backend.join(".git").join("config")).unwrap();
@@ -3384,13 +3679,15 @@ mod tests {
         assert!(pom.contains("<artifactId>local-audit</artifactId>"));
         assert!(pom.contains("<revision>9.8.7-SNAPSHOT</revision>"));
         assert!(pom.contains("<java.version>17</java.version>"));
+        assert!(pom.contains("<module>local-audit-server</module>"));
+        assert!(pom.contains("<module>local-audit-module-system</module>"));
         let dependencies_pom =
-            fs::read_to_string(backend.join("yudao-dependencies").join("pom.xml")).unwrap();
+            fs::read_to_string(backend.join("local-audit-dependencies").join("pom.xml")).unwrap();
         assert!(dependencies_pom.contains("<revision>9.8.7-SNAPSHOT</revision>"));
 
         let application = fs::read_to_string(
             backend
-                .join("yudao-server")
+                .join("local-audit-server")
                 .join("src")
                 .join("main")
                 .join("resources")
@@ -3400,7 +3697,7 @@ mod tests {
         assert!(application.contains("  tenant: # 多租户相关配置项\n    enable: false"));
         let local_profile = fs::read_to_string(
             backend
-                .join("yudao-server")
+                .join("local-audit-server")
                 .join("src")
                 .join("main")
                 .join("resources")
@@ -3431,6 +3728,7 @@ mod tests {
 
         audit_root_sql_has_no_unselected_business_tables(&backend.join("sql"));
         audit_runtime_metadata_has_no_old_package(&backend);
+        audit_generated_tree_has_no_template_module_prefix(&backend);
         assert_eq!(
             filter_unselected_module_sql(&backend.join("sql"), &answers.modules).unwrap(),
             0,
@@ -3450,7 +3748,7 @@ mod tests {
                 String::from_utf8_lossy(&build.stderr)
             );
             if std::env::var_os("YUDAO_SCAFFOLD_RUN_STARTUP").is_some() {
-                smoke_test_generated_server(&backend);
+                smoke_test_generated_server(&backend, &answers.artifact_id);
             }
         }
         fs::remove_dir_all(test_root).unwrap();
@@ -3576,8 +3874,36 @@ mod tests {
         }
     }
 
-    fn smoke_test_generated_server(backend: &Path) {
-        let target = backend.join("yudao-server").join("target");
+    fn audit_generated_tree_has_no_template_module_prefix(root: &Path) {
+        for entry in fs::read_dir(root).unwrap() {
+            let path = entry.unwrap().path();
+            let name = path.file_name().unwrap().to_string_lossy();
+            if path.is_dir() {
+                if matches!(name.as_ref(), ".git" | "target") {
+                    continue;
+                }
+                audit_generated_tree_has_no_template_module_prefix(&path);
+            }
+            assert!(
+                !name.contains("yudao-"),
+                "generated path still uses the template module prefix: {}",
+                path.display()
+            );
+            if should_rewrite_file(&path) {
+                let Ok(text) = fs::read_to_string(&path) else {
+                    continue;
+                };
+                assert!(
+                    !text.contains("yudao-"),
+                    "generated text still uses the template module prefix: {}",
+                    path.display()
+                );
+            }
+        }
+    }
+
+    fn smoke_test_generated_server(backend: &Path, artifact_id: &str) {
+        let target = backend.join(format!("{artifact_id}-server")).join("target");
         let jar = fs::read_dir(&target)
             .unwrap()
             .filter_map(Result::ok)
@@ -3610,9 +3936,10 @@ mod tests {
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr)
         );
+        let application_name = format!("{}ServerApplication", upper_camel_artifact_id(artifact_id));
         assert!(
-            logs.contains("Starting YudaoServerApplication")
-                || logs.contains("Started YudaoServerApplication"),
+            logs.contains(&format!("Starting {application_name}"))
+                || logs.contains(&format!("Started {application_name}")),
             "generated server did not reach Spring application startup\n{logs}"
         );
         for forbidden in [
