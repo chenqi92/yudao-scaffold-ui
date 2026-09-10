@@ -7,9 +7,12 @@ const {
   projectNameValid,
   artifactIdValid,
   basePackageValid,
+  gitRemotesValid,
   syncBasePackage,
   syncArtifactFromProjectName,
-  pickOutputDir
+  pickOutputDir,
+  addGitRemote,
+  removeGitRemote
 } = useScaffold();
 </script>
 
@@ -89,6 +92,25 @@ const {
         />
         <div class="field-help">cn.iocoder.yudao 将被全局替换为这个包</div>
       </el-form-item>
+
+      <div class="group-title">Git 仓库（可选）</div>
+      <p class="field-help git-help">
+        可配置多个 remote。生成器会直接初始化标准 <code>.git</code> 目录，不要求系统安装 Git；提交和推送仍需 Git 客户端。
+      </p>
+      <div class="git-remotes">
+        <div v-for="(remote, idx) in form.gitRemotes" :key="idx" class="git-remote-row">
+          <el-input v-model="remote.name" placeholder="remote 名称，如 origin" />
+          <el-input v-model="remote.url" placeholder="https://... 或 git@host:owner/repo.git" />
+          <el-button type="danger" plain @click="removeGitRemote(idx)">删除</el-button>
+        </div>
+        <el-alert
+          v-if="!gitRemotesValid"
+          type="error"
+          :closable="false"
+          title="remote 名称必须合法且不能重复，每项都要填写仓库地址"
+        />
+        <el-button plain @click="addGitRemote">添加 Git 地址</el-button>
+      </div>
     </el-form>
   </section>
 </template>
@@ -100,5 +122,23 @@ code {
   border-radius: var(--radius-sm);
   font-family: 'SF Mono', Monaco, Consolas, monospace;
   font-size: 12px;
+}
+
+.git-help {
+  margin: -4px 0 12px;
+}
+
+.git-remotes {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 10px;
+}
+
+.git-remote-row {
+  display: grid;
+  grid-template-columns: 180px minmax(320px, 1fr) auto;
+  gap: 10px;
+  width: 100%;
 }
 </style>

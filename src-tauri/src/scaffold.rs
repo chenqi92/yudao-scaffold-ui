@@ -31,6 +31,8 @@ struct ScaffoldAnswers {
     artifact_id: String,
     version: String,
     base_package: String,
+    #[serde(default)]
+    git_remotes: Vec<GitRemote>,
     modules: Vec<String>,
     frontends: Vec<String>,
     monolith_port: Option<u16>,
@@ -39,10 +41,42 @@ struct ScaffoldAnswers {
     microservice_ports: HashMap<String, Vec<u16>>,
     super_admin_username: String,
     super_admin_password: String,
+    #[serde(default)]
+    database: DatabaseSettings,
+    #[serde(default)]
+    redis: RedisSettings,
     pull_existing: bool,
     force: Option<bool>,
     tenant_enabled: bool,
     vben_variant: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct GitRemote {
+    name: String,
+    url: String,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct DatabaseSettings {
+    enabled: bool,
+    url: String,
+    username: String,
+    password: String,
+    slave_enabled: bool,
+    slave_url: String,
+    slave_username: String,
+    slave_password: String,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct RedisSettings {
+    enabled: bool,
+    host: String,
+    port: u16,
+    database: u8,
+    password: String,
 }
 
 #[derive(Clone, Copy)]
@@ -160,17 +194,31 @@ pub async fn run_scaffold(app: AppHandle, payload: RunPayload) -> Result<i32, St
     if !output_dir.is_absolute() {
         return Err("输出目录必须是绝对路径".to_string());
     }
-    if output_dir.exists() {
-        if answers.force != Some(true) {
-            return Err("输出目录已存在，请确认强制覆盖后再生成".to_string());
-        }
-        if !output_dir.is_dir() {
-            return Err("输出路径已存在，但不是目录".to_string());
-        }
-        guard_removable_output_dir(&output_dir)?;
+    if output_dir.exists() && !output_dir.is_dir() {
+        return Err("输出路径已存在，但不是目录".to_string());
     }
-    let mut staged_output = StagedOutputDir::new(&output_dir)?;
-    let generation_dir = staged_output.path().to_path_buf();
+    fs::create_dir_all(&output_dir).map_err(|e| format!("创建所选输出目录失败: {e}"))?;
+
+    let backend_target = output_dir.join("backend");
+    let frontend_target = output_dir.join("frontend");
+    let managed_output_exists = backend_target.exists() || frontend_target.exists();
+    if managed_output_exists && answers.force != Some(true) {
+        return Err("所选目录中已存在 backend/ 或 frontend/，请确认覆盖后再生成".to_string());
+    }
+    for target in [&backend_target, &frontend_target] {
+        if target.exists() {
+            if !target.is_dir() {
+                return Err(format!("受管理输出路径不是目录: {}", target.display()));
+            }
+            guard_removable_output_dir(target)?;
+        }
+    }
+    let mut staged_backend = StagedOutputDir::new(&backend_target)?;
+    let mut staged_frontend = if answers.frontends.is_empty() {
+        None
+    } else {
+        Some(StagedOutputDir::new(&frontend_target)?)
+    };
 
     let mut selected_templates = Vec::new();
     selected_templates.push(if answers.backend == "microservice" {
@@ -215,10 +263,32 @@ pub async fn run_scaffold(app: AppHandle, payload: RunPayload) -> Result<i32, St
         &app,
     )
     .await?;
-    let backend_dst = generation_dir.join("backend");
+    let backend_dst = staged_backend.path().to_path_buf();
     copy_dir_contents(&backend_src, &backend_dst).map_err(|e| format!("复制后端模板失败: {e}"))?;
+    clean_backend_template(&backend_dst)?;
     prune_backend_modules(&backend_dst, &answers.modules)?;
-    customize_backend_tree(&backend_dst, answers)?;
+    let removed_sql_rows = customize_backend_tree(&backend_dst, answers)?;
+    if removed_sql_rows > 0 {
+        emit_info(
+            &app,
+            &format!("已从初始化 SQL 裁剪 {removed_sql_rows} 条未选模块数据"),
+        );
+    }
+    let optional_modules = answers
+        .modules
+        .iter()
+        .filter(|module| !matches!(module.as_str(), "system" | "infra"))
+        .cloned()
+        .collect::<Vec<_>>();
+    if !optional_modules.is_empty() {
+        emit_warn(
+            &app,
+            &format!(
+                "所选可选模块 {} 的完整生产 SQL 不随官方开源模板提供，请按对应模块官方文档另行导入",
+                optional_modules.join(", ")
+            ),
+        );
+    }
     emit_ok(&app, "后端模板已写入 backend/");
 
     for frontend_id in &answers.frontends {
@@ -246,7 +316,11 @@ pub async fn run_scaffold(app: AppHandle, payload: RunPayload) -> Result<i32, St
             &app,
         )
         .await?;
-        let dst = generation_dir.join("frontend").join(frontend.role_suffix);
+        let dst = staged_frontend
+            .as_ref()
+            .expect("frontend staging exists when a frontend is selected")
+            .path()
+            .join(frontend.role_suffix);
         copy_dir_contents(&src, &dst).map_err(|e| format!("复制前端模板失败: {e}"))?;
         customize_frontend_tree(&dst, frontend_id, answers)?;
         emit_ok(
@@ -259,10 +333,19 @@ pub async fn run_scaffold(app: AppHandle, payload: RunPayload) -> Result<i32, St
     }
 
     emit_phase(&app, total - 1, total, "写入脚手架说明");
-    write_scaffold_manifest(&generation_dir, &payload)?;
+    write_project_readme(&backend_dst, answers)?;
+    initialize_git_repository(&backend_dst, &answers.git_remotes)?;
 
-    if let Some(warning) = staged_output.commit(&output_dir)? {
+    if let Some(warning) = staged_backend.commit(&backend_target)? {
         emit_warn(&app, &warning);
+    }
+    if let Some(frontend) = staged_frontend.as_mut() {
+        if let Some(warning) = frontend.commit(&frontend_target)? {
+            emit_warn(&app, &warning);
+        }
+    } else if frontend_target.exists() {
+        fs::remove_dir_all(&frontend_target)
+            .map_err(|e| format!("删除未选择的 frontend/ 失败: {e}"))?;
     }
 
     emit_phase(&app, total, total, "生成完成");
@@ -506,7 +589,15 @@ fn copy_dir_inner(source: &Path, destination: &Path) -> io::Result<()> {
         let name = name.to_string_lossy();
         if matches!(
             name.as_ref(),
-            ".git" | "node_modules" | "target" | ".idea" | ".vscode"
+            ".git"
+                | ".gitee"
+                | ".github"
+                | ".image"
+                | "node_modules"
+                | "target"
+                | ".idea"
+                | ".vscode"
+                | "yudao-ui"
         ) {
             continue;
         }
@@ -524,6 +615,40 @@ const SELECTABLE_MODULES: &[&str] = &[
     "system", "infra", "member", "bpm", "pay", "mp", "mall", "crm", "erp", "iot", "mes", "report",
     "ai",
 ];
+
+fn clean_backend_template(root: &Path) -> Result<(), String> {
+    for relative in ["yudao-ui", ".gitee", ".github", ".image"] {
+        let path = root.join(relative);
+        if path.exists() {
+            fs::remove_dir_all(&path)
+                .map_err(|e| format!("清理模板目录 {} 失败: {e}", path.display()))?;
+        }
+    }
+
+    let infra_java = root
+        .join("yudao-module-infra")
+        .join("src")
+        .join("main")
+        .join("java")
+        .join("cn")
+        .join("iocoder")
+        .join("yudao")
+        .join("module")
+        .join("infra");
+    for relative in [
+        "controller/admin/demo",
+        "dal/dataobject/demo",
+        "dal/mysql/demo",
+        "service/demo",
+    ] {
+        let path = infra_java.join(relative);
+        if path.exists() {
+            fs::remove_dir_all(&path)
+                .map_err(|e| format!("清理演示代码 {} 失败: {e}", path.display()))?;
+        }
+    }
+    Ok(())
+}
 
 fn prune_backend_modules(root: &Path, selected_modules: &[String]) -> Result<(), String> {
     let selected = selected_modules
@@ -677,7 +802,7 @@ fn write_lines_preserving_final_newline(
     fs::write(path, updated).map_err(|e| format!("{action}失败 {}: {e}", path.display()))
 }
 
-fn customize_backend_tree(root: &Path, answers: &ScaffoldAnswers) -> Result<(), String> {
+fn customize_backend_tree(root: &Path, answers: &ScaffoldAnswers) -> Result<usize, String> {
     let slash_package = answers.base_package.replace('.', "/");
     let backslash_package = answers.base_package.replace('.', "\\");
     let artifact_tag = format!("<artifactId>{}</artifactId>", answers.artifact_id);
@@ -694,7 +819,7 @@ fn customize_backend_tree(root: &Path, answers: &ScaffoldAnswers) -> Result<(), 
     set_xml_tag_value(&root.join("pom.xml"), "revision", &answers.version)?;
     relocate_java_packages(root, &answers.base_package)?;
     configure_backend_settings(root, answers)?;
-    Ok(())
+    filter_unselected_module_sql(&root.join("sql"), &answers.modules)
 }
 
 fn customize_frontend_tree(
@@ -764,15 +889,14 @@ fn configure_backend_settings(root: &Path, answers: &ScaffoldAnswers) -> Result<
             .monolith_port
             .ok_or_else(|| "单体项目缺少服务端口".to_string())?;
         for profile in ["application-local.yaml", "application-dev.yaml"] {
-            set_top_level_server_port(
-                &root
-                    .join("yudao-server")
-                    .join("src")
-                    .join("main")
-                    .join("resources")
-                    .join(profile),
-                port,
-            )?;
+            let path = root
+                .join("yudao-server")
+                .join("src")
+                .join("main")
+                .join("resources")
+                .join(profile);
+            set_top_level_server_port(&path, port)?;
+            configure_connection_profile(&path, &answers.database, &answers.redis)?;
         }
         set_tenant_enabled(
             &root
@@ -833,6 +957,13 @@ fn configure_microservice_settings(root: &Path, answers: &ScaffoldAnswers) -> Re
                 return Err(format!("端口 {port} 同时分配给 {existing} 和 {owner}"));
             }
             configure_microservice_port(resources, port)?;
+            for profile in ["application-local.yaml", "application-dev.yaml"] {
+                configure_connection_profile(
+                    &resources.join(profile),
+                    &answers.database,
+                    &answers.redis,
+                )?;
+            }
             let _ = set_tenant_enabled_if_present(
                 &resources.join("application.yaml"),
                 answers.tenant_enabled,
@@ -946,6 +1077,164 @@ fn set_top_level_server_port(path: &Path, port: u16) -> Result<(), String> {
     write_lines_preserving_final_newline(path, &text, lines, "写入服务端口")
 }
 
+fn configure_connection_profile(
+    path: &Path,
+    database: &DatabaseSettings,
+    redis: &RedisSettings,
+) -> Result<(), String> {
+    if database.enabled {
+        configure_database_yaml(path, database)?;
+    }
+    if redis.enabled {
+        configure_redis_yaml(path, redis)?;
+    }
+    Ok(())
+}
+
+fn configure_database_yaml(path: &Path, settings: &DatabaseSettings) -> Result<(), String> {
+    if settings.url.trim().is_empty() || settings.username.trim().is_empty() {
+        return Err("启用自定义数据库后，主库 URL 和账号不能为空".to_string());
+    }
+    if settings.slave_enabled
+        && (settings.slave_url.trim().is_empty() || settings.slave_username.trim().is_empty())
+    {
+        return Err("启用从库后，从库 URL 和账号不能为空".to_string());
+    }
+    let text = fs::read_to_string(path)
+        .map_err(|e| format!("读取数据库配置失败 {}: {e}", path.display()))?;
+    let mut lines = text.lines().map(str::to_string).collect::<Vec<_>>();
+    update_datasource_block(
+        &mut lines,
+        "master",
+        &settings.url,
+        &settings.username,
+        &settings.password,
+    )?;
+    if settings.slave_enabled {
+        update_datasource_block(
+            &mut lines,
+            "slave",
+            &settings.slave_url,
+            &settings.slave_username,
+            &settings.slave_password,
+        )?;
+    } else {
+        remove_yaml_mapping_block(&mut lines, "slave", 8);
+    }
+    write_lines_preserving_final_newline(path, &text, lines, "写入数据库配置")
+}
+
+fn update_datasource_block(
+    lines: &mut [String],
+    name: &str,
+    url: &str,
+    username: &str,
+    password: &str,
+) -> Result<(), String> {
+    let marker = format!("        {name}:");
+    let start = lines
+        .iter()
+        .position(|line| line.starts_with(&marker))
+        .ok_or_else(|| format!("模板缺少 {name} 数据源配置"))?;
+    for (key, value) in [("url", url), ("username", username), ("password", password)] {
+        let property = format!("          {key}:");
+        let index = ((start + 1)..lines.len())
+            .take_while(|index| {
+                let line = &lines[*index];
+                line.trim().is_empty()
+                    || line
+                        .chars()
+                        .take_while(|character| character.is_whitespace())
+                        .count()
+                        > 8
+            })
+            .find(|index| lines[*index].starts_with(&property))
+            .ok_or_else(|| format!("模板的 {name} 数据源缺少 {key} 配置"))?;
+        lines[index] = format!("{property} {}", yaml_string(value));
+    }
+    Ok(())
+}
+
+fn remove_yaml_mapping_block(lines: &mut Vec<String>, name: &str, indent: usize) {
+    let marker = format!("{}{name}:", " ".repeat(indent));
+    let Some(start) = lines.iter().position(|line| line.starts_with(&marker)) else {
+        return;
+    };
+    let mut end = start + 1;
+    while end < lines.len() {
+        let line = &lines[end];
+        if line.trim().is_empty()
+            || line
+                .chars()
+                .take_while(|character| character.is_whitespace())
+                .count()
+                > indent
+        {
+            end += 1;
+        } else {
+            break;
+        }
+    }
+    lines.drain(start..end);
+}
+
+fn configure_redis_yaml(path: &Path, settings: &RedisSettings) -> Result<(), String> {
+    if settings.host.trim().is_empty() {
+        return Err("启用自定义 Redis 后，Redis 地址不能为空".to_string());
+    }
+    let text = fs::read_to_string(path)
+        .map_err(|e| format!("读取 Redis 配置失败 {}: {e}", path.display()))?;
+    let mut lines = text.lines().map(str::to_string).collect::<Vec<_>>();
+    let start = lines
+        .iter()
+        .position(|line| line == "    redis:")
+        .ok_or_else(|| format!("{} 缺少 spring.data.redis 配置", path.display()))?;
+    for (key, value) in [
+        ("host", yaml_string(&settings.host)),
+        ("port", settings.port.to_string()),
+        ("database", settings.database.to_string()),
+    ] {
+        let property = format!("      {key}:");
+        let index = ((start + 1)..lines.len())
+            .take_while(|index| {
+                let line = &lines[*index];
+                line.trim().is_empty()
+                    || line.starts_with(char::is_whitespace)
+                    || line.trim_start().starts_with('#')
+            })
+            .find(|index| lines[*index].starts_with(&property))
+            .ok_or_else(|| format!("模板的 Redis 配置缺少 {key}"))?;
+        lines[index] = format!("{property} {value}");
+    }
+    let password_index = ((start + 1)..lines.len())
+        .take_while(|index| {
+            let line = &lines[*index];
+            line.trim().is_empty()
+                || line.starts_with(char::is_whitespace)
+                || line.trim_start().starts_with('#')
+        })
+        .find(|index| lines[*index].contains("password:"));
+    if settings.password.is_empty() {
+        if let Some(index) = password_index {
+            if !lines[index].trim_start().starts_with('#') {
+                lines[index] = "#      password:".to_string();
+            }
+        }
+    } else if let Some(index) = password_index {
+        lines[index] = format!("      password: {}", yaml_string(&settings.password));
+    } else {
+        lines.insert(
+            start + 4,
+            format!("      password: {}", yaml_string(&settings.password)),
+        );
+    }
+    write_lines_preserving_final_newline(path, &text, lines, "写入 Redis 配置")
+}
+
+fn yaml_string(value: &str) -> String {
+    serde_json::to_string(value).unwrap_or_else(|_| "\"\"".to_string())
+}
+
 fn set_tenant_enabled(path: &Path, enabled: bool) -> Result<(), String> {
     if set_tenant_enabled_if_present(path, enabled)? {
         Ok(())
@@ -958,21 +1247,21 @@ fn set_tenant_enabled_if_present(path: &Path, enabled: bool) -> Result<bool, Str
     let text = fs::read_to_string(path)
         .map_err(|e| format!("读取租户配置失败 {}: {e}", path.display()))?;
     let mut lines = text.lines().map(str::to_string).collect::<Vec<_>>();
-    let Some(yudao_index) = lines
+    let tenant_index = lines
         .iter()
-        .position(|line| line.trim() == "yudao:" && !line.starts_with(char::is_whitespace))
-    else {
-        return Ok(false);
-    };
-    let Some(tenant_index) = ((yudao_index + 1)..lines.len())
-        .take_while(|index| {
-            let line = &lines[*index];
-            line.trim().is_empty()
-                || line.trim_start().starts_with('#')
-                || line.starts_with(char::is_whitespace)
-        })
-        .find(|index| lines[*index].starts_with("  tenant:"))
-    else {
+        .enumerate()
+        .filter(|(_, line)| line.trim() == "yudao:" && !line.starts_with(char::is_whitespace))
+        .find_map(|(yudao_index, _)| {
+            ((yudao_index + 1)..lines.len())
+                .take_while(|index| {
+                    let line = &lines[*index];
+                    line.trim().is_empty()
+                        || line.trim_start().starts_with('#')
+                        || line.starts_with(char::is_whitespace)
+                })
+                .find(|index| lines[*index].starts_with("  tenant:"))
+        });
+    let Some(tenant_index) = tenant_index else {
         return Ok(false);
     };
     let tenant_indent = lines[tenant_index]
@@ -1101,6 +1390,415 @@ fn sql_string_range(line: &str, search_from: usize) -> Option<(usize, usize)> {
     None
 }
 
+#[derive(Debug)]
+struct SqlInsert {
+    table: String,
+    columns: Vec<String>,
+    values: Vec<String>,
+}
+
+impl SqlInsert {
+    fn value(&self, column: &str) -> Option<&str> {
+        let index = self
+            .columns
+            .iter()
+            .position(|candidate| candidate == column)?;
+        self.values.get(index).map(String::as_str)
+    }
+
+    fn string_value(&self, column: &str) -> Option<String> {
+        unquote_sql_string(self.value(column)?)
+    }
+
+    fn integer_value(&self, column: &str) -> Option<u64> {
+        self.value(column)?.trim().parse().ok()
+    }
+}
+
+fn filter_unselected_module_sql(
+    sql_root: &Path,
+    selected_modules: &[String],
+) -> Result<usize, String> {
+    let selected = selected_modules
+        .iter()
+        .map(String::as_str)
+        .collect::<HashSet<_>>();
+    let mut removed_rows = 0;
+    filter_sql_tree(sql_root, &selected, &mut removed_rows)?;
+    Ok(removed_rows)
+}
+
+fn filter_sql_tree(
+    root: &Path,
+    selected: &HashSet<&str>,
+    removed_rows: &mut usize,
+) -> Result<(), String> {
+    for entry in
+        fs::read_dir(root).map_err(|e| format!("读取 SQL 目录失败 {}: {e}", root.display()))?
+    {
+        let entry = entry.map_err(|e| format!("读取 SQL 目录项失败: {e}"))?;
+        let path = entry.path();
+        if path.is_dir() {
+            filter_sql_tree(&path, selected, removed_rows)?;
+            continue;
+        }
+        if path.extension().and_then(|value| value.to_str()) != Some("sql")
+            || path.file_name().and_then(|value| value.to_str()) == Some("quartz.sql")
+        {
+            continue;
+        }
+        *removed_rows += filter_sql_file(&path, selected)?;
+    }
+    Ok(())
+}
+
+fn filter_sql_file(path: &Path, selected: &HashSet<&str>) -> Result<usize, String> {
+    let text = fs::read_to_string(path)
+        .map_err(|e| format!("读取 SQL 文件失败 {}: {e}", path.display()))?;
+    let (lines, removed_demo_sections) = strip_demo_sql_sections(&text);
+    let records = lines
+        .iter()
+        .map(|line| parse_sql_insert(line))
+        .collect::<Vec<_>>();
+
+    let mut menu_parents = HashMap::new();
+    let mut removed_menu_ids = HashSet::new();
+    let mut removed_codegen_table_ids = HashSet::new();
+    for record in records.iter().flatten() {
+        if record.table == "infra_codegen_table"
+            && record
+                .string_value("table_name")
+                .is_some_and(|name| name.to_ascii_lowercase().starts_with("yudao_demo"))
+        {
+            if let Some(id) = record.integer_value("id") {
+                removed_codegen_table_ids.insert(id);
+            }
+        }
+        if record.table != "system_menu" {
+            continue;
+        }
+        let (Some(id), Some(parent_id)) = (
+            record.integer_value("id"),
+            record.integer_value("parent_id"),
+        ) else {
+            continue;
+        };
+        menu_parents.insert(id, parent_id);
+        if record_is_demo_menu(record)
+            || record_module(record).is_some_and(|module| !selected.contains(module))
+        {
+            removed_menu_ids.insert(id);
+        }
+    }
+    loop {
+        let before = removed_menu_ids.len();
+        for (id, parent_id) in &menu_parents {
+            if removed_menu_ids.contains(parent_id) {
+                removed_menu_ids.insert(*id);
+            }
+        }
+        if removed_menu_ids.len() == before {
+            break;
+        }
+    }
+
+    let mut removed = 0;
+    let filtered = lines
+        .into_iter()
+        .zip(records)
+        .filter_map(|(line, record)| {
+            let should_remove = record
+                .as_ref()
+                .is_some_and(|record| match record.table.as_str() {
+                    "system_menu" => record
+                        .integer_value("id")
+                        .is_some_and(|id| removed_menu_ids.contains(&id)),
+                    "system_role_menu" => record
+                        .integer_value("menu_id")
+                        .is_some_and(|id| removed_menu_ids.contains(&id)),
+                    "system_dict_type" | "system_dict_data" => record
+                        .string_value("dict_type")
+                        .or_else(|| record.string_value("type"))
+                        .and_then(|dict_type| module_for_dict_type(&dict_type))
+                        .is_some_and(|module| !selected.contains(module)),
+                    "infra_job" => record
+                        .string_value("handler_name")
+                        .and_then(|handler| module_for_job_handler(&handler))
+                        .is_some_and(|module| !selected.contains(module)),
+                    "infra_codegen_table" => record
+                        .integer_value("id")
+                        .is_some_and(|id| removed_codegen_table_ids.contains(&id)),
+                    "infra_codegen_column" => record
+                        .integer_value("table_id")
+                        .is_some_and(|id| removed_codegen_table_ids.contains(&id)),
+                    _ => false,
+                });
+            if should_remove {
+                removed += 1;
+                None
+            } else {
+                Some(line)
+            }
+        })
+        .collect::<Vec<_>>();
+
+    if removed > 0 || removed_demo_sections > 0 {
+        write_lines_preserving_final_newline(path, &text, filtered, "写入裁剪后的 SQL")?;
+    }
+    Ok(removed + removed_demo_sections)
+}
+
+fn strip_demo_sql_sections(text: &str) -> (Vec<String>, usize) {
+    let mut kept = Vec::new();
+    let mut skipping = false;
+    let mut passed_header_separator = false;
+    let mut removed_sections = 0;
+    for line in text.lines() {
+        let lower = line.to_ascii_lowercase();
+        let marker = line.trim() == "-- ----------------------------";
+        if !skipping
+            && ((lower.contains("table structure for") || lower.contains("records of"))
+                && lower.contains("yudao_demo"))
+        {
+            if kept.last().is_some_and(|previous: &String| {
+                previous.trim() == "-- ----------------------------"
+            }) {
+                kept.pop();
+            }
+            skipping = true;
+            passed_header_separator = false;
+            removed_sections += 1;
+            continue;
+        }
+        if skipping {
+            if marker {
+                if passed_header_separator {
+                    skipping = false;
+                    kept.push(line.to_string());
+                } else {
+                    passed_header_separator = true;
+                }
+            }
+            continue;
+        }
+        kept.push(line.to_string());
+    }
+    (kept, removed_sections)
+}
+
+fn parse_sql_insert(line: &str) -> Option<SqlInsert> {
+    let lower = line.to_ascii_lowercase();
+    let insert_start = lower.find("insert into")? + "insert into".len();
+    let columns_start = line[insert_start..].find('(')? + insert_start;
+    let table_token = line[insert_start..columns_start].trim();
+    let table = table_token
+        .rsplit('.')
+        .next()?
+        .trim_matches(|character| matches!(character, '`' | '"' | '[' | ']'))
+        .to_ascii_lowercase();
+    let columns_end = line[columns_start + 1..].find(')')? + columns_start + 1;
+    let columns = line[columns_start + 1..columns_end]
+        .split(',')
+        .map(|column| {
+            column
+                .trim()
+                .trim_matches(|character| matches!(character, '`' | '"' | '[' | ']'))
+                .to_ascii_lowercase()
+        })
+        .collect::<Vec<_>>();
+    let values_keyword = lower[columns_end + 1..].find("values")? + columns_end + 1;
+    let values_start = line[values_keyword..].find('(')? + values_keyword;
+    let values_end = matching_closing_parenthesis(line, values_start)?;
+    let values = parse_sql_csv(&line[values_start + 1..values_end]);
+    if columns.len() != values.len() {
+        return None;
+    }
+    Some(SqlInsert {
+        table,
+        columns,
+        values,
+    })
+}
+
+fn matching_closing_parenthesis(text: &str, opening: usize) -> Option<usize> {
+    let bytes = text.as_bytes();
+    let mut depth = 0;
+    let mut quoted = false;
+    let mut index = opening;
+    while index < bytes.len() {
+        match bytes[index] {
+            b'\\' if quoted => index += 2,
+            b'\'' if quoted && bytes.get(index + 1) == Some(&b'\'') => index += 2,
+            b'\'' => {
+                quoted = !quoted;
+                index += 1;
+            }
+            b'(' if !quoted => {
+                depth += 1;
+                index += 1;
+            }
+            b')' if !quoted => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(index);
+                }
+                index += 1;
+            }
+            _ => index += 1,
+        }
+    }
+    None
+}
+
+fn parse_sql_csv(text: &str) -> Vec<String> {
+    let bytes = text.as_bytes();
+    let mut values = Vec::new();
+    let mut start = 0;
+    let mut depth = 0;
+    let mut quoted = false;
+    let mut index = 0;
+    while index < bytes.len() {
+        match bytes[index] {
+            b'\\' if quoted => index += 2,
+            b'\'' if quoted && bytes.get(index + 1) == Some(&b'\'') => index += 2,
+            b'\'' => {
+                quoted = !quoted;
+                index += 1;
+            }
+            b'(' if !quoted => {
+                depth += 1;
+                index += 1;
+            }
+            b')' if !quoted => {
+                depth -= 1;
+                index += 1;
+            }
+            b',' if !quoted && depth == 0 => {
+                values.push(text[start..index].trim().to_string());
+                start = index + 1;
+                index += 1;
+            }
+            _ => index += 1,
+        }
+    }
+    values.push(text[start..].trim().to_string());
+    values
+}
+
+fn unquote_sql_string(value: &str) -> Option<String> {
+    let trimmed = value.trim();
+    let quoted = trimmed
+        .strip_prefix("N'")
+        .or_else(|| trimmed.strip_prefix('\''))?;
+    let content = quoted.strip_suffix('\'')?;
+    Some(content.replace("''", "'").replace("\\'", "'"))
+}
+
+fn record_module(record: &SqlInsert) -> Option<&'static str> {
+    let fields = ["permission", "path", "component", "component_name"]
+        .iter()
+        .filter_map(|column| record.string_value(column))
+        .map(|value| value.to_ascii_lowercase())
+        .collect::<Vec<_>>();
+    module_from_route_fields(&fields)
+}
+
+fn record_is_demo_menu(record: &SqlInsert) -> bool {
+    ["permission", "path", "component", "component_name"]
+        .iter()
+        .filter_map(|column| record.string_value(column))
+        .map(|value| value.to_ascii_lowercase())
+        .any(|value| {
+            let normalized = value.trim_start_matches('/');
+            normalized.starts_with("demo")
+                || normalized.contains("/demo")
+                || normalized.contains(":demo")
+        })
+}
+
+fn module_from_route_fields(fields: &[String]) -> Option<&'static str> {
+    for (module, prefixes) in module_prefixes() {
+        if fields.iter().any(|field| {
+            prefixes.iter().any(|prefix| {
+                let normalized = field.trim_start_matches('/');
+                normalized == *prefix
+                    || normalized.starts_with(&format!("{prefix}:"))
+                    || normalized.starts_with(&format!("{prefix}/"))
+            })
+        }) {
+            return Some(module);
+        }
+    }
+    None
+}
+
+fn module_for_dict_type(dict_type: &str) -> Option<&'static str> {
+    let lower = dict_type.to_ascii_lowercase();
+    for (module, prefixes) in module_prefixes() {
+        if prefixes
+            .iter()
+            .any(|prefix| lower == *prefix || lower.starts_with(&format!("{prefix}_")))
+        {
+            return Some(module);
+        }
+    }
+    if lower == "merchant_type" {
+        return Some("wms");
+    }
+    None
+}
+
+fn module_for_job_handler(handler: &str) -> Option<&'static str> {
+    let lower = handler.to_ascii_lowercase();
+    const MALL_JOB_PREFIXES: &[&str] = &[
+        "product",
+        "promotion",
+        "trade",
+        "statistics",
+        "brokerage",
+        "combination",
+        "coupon",
+    ];
+    if MALL_JOB_PREFIXES
+        .iter()
+        .any(|prefix| lower.starts_with(prefix))
+    {
+        return Some("mall");
+    }
+    module_prefixes().iter().find_map(|(module, prefixes)| {
+        prefixes
+            .iter()
+            .any(|prefix| lower.starts_with(prefix))
+            .then_some(*module)
+    })
+}
+
+fn module_prefixes() -> &'static [(&'static str, &'static [&'static str])] {
+    &[
+        ("system", &["system"]),
+        ("infra", &["infra"]),
+        ("member", &["member"]),
+        ("bpm", &["bpm"]),
+        ("pay", &["pay"]),
+        ("mp", &["mp"]),
+        (
+            "mall",
+            &["mall", "product", "promotion", "trade", "statistics"],
+        ),
+        ("crm", &["crm"]),
+        ("erp", &["erp"]),
+        ("iot", &["iot"]),
+        ("mes", &["mes"]),
+        ("report", &["report"]),
+        ("ai", &["ai"]),
+        ("wms", &["wms"]),
+        ("hrm", &["hrm"]),
+        ("fms", &["fms"]),
+        ("pms", &["pms"]),
+        ("im", &["im"]),
+    ]
+}
+
 fn rewrite_text_files(root: &Path, replacements: &[(&str, &str)]) -> Result<(), String> {
     if !root.exists() {
         return Ok(());
@@ -1209,39 +1907,101 @@ fn collect_java_roots(root: &Path, out: &mut Vec<PathBuf>) -> Result<(), String>
     Ok(())
 }
 
-fn write_scaffold_manifest(output_dir: &Path, payload: &RunPayload) -> Result<(), String> {
-    let answers = &payload.answers;
-    let selected = serde_json::to_string_pretty(&json!({
-        "projectName": &answers.project_name,
-        "displayName": &answers.display_name,
-        "backend": &answers.backend,
-        "jdkVersion": &answers.jdk_version,
-        "groupId": &answers.group_id,
-        "artifactId": &answers.artifact_id,
-        "version": &answers.version,
-        "basePackage": &answers.base_package,
-        "modules": &answers.modules,
-        "frontends": &answers.frontends,
-        "tenantEnabled": answers.tenant_enabled,
-        "superAdminUsername": &answers.super_admin_username,
-        "superAdminPasswordConfigured": !answers.super_admin_password.is_empty(),
-        "monolithPort": answers.monolith_port,
-        "gatewayPort": answers.gateway_port,
-        "microservicePorts": &answers.microservice_ports,
-        "vbenVariant": &answers.vben_variant,
-        "mirror": &payload.mirror,
-    }))
-    .map_err(|e| format!("序列化生成配置失败: {e}"))?;
-
+fn write_project_readme(backend_dir: &Path, answers: &ScaffoldAnswers) -> Result<(), String> {
+    let optional_modules = answers
+        .modules
+        .iter()
+        .filter(|module| !matches!(module.as_str(), "system" | "infra"))
+        .cloned()
+        .collect::<Vec<_>>();
+    let sql_note = if optional_modules.is_empty() {
+        "".to_string()
+    } else {
+        format!(
+            "\n## 数据库说明\n\n官方开源模板不附带可选模块 `{}` 的完整生产 SQL，请按各模块官方文档另行获取并导入。\n",
+            optional_modules.join("`, `")
+        )
+    };
+    let port = if answers.backend == "microservice" {
+        answers.gateway_port
+    } else {
+        answers.monolith_port
+    }
+    .unwrap_or(DEFAULT_MONOLITH_PORT);
     let readme = format!(
-        "# {}\n\n由 yudao-scaffold-ui 生成。\n\n## 目录\n\n- `backend/`: 后端模板\n- `frontend/`: 选中的前端模板\n\n## 生成配置\n\n```json\n{}\n```\n",
-        answers.display_name, selected
+        "# {}\n\n`{}` 是由 yudao-scaffold 生成的 {}后端项目。\n\n## 项目信息\n\n- Maven：`{}:{}:{}`\n- Java 包：`{}`\n- JDK：{}\n- 业务模块：`{}`\n- 服务端口：{}\n- 多租户：{}\n\n## 本地启动\n\n1. 按需调整 `yudao-server/src/main/resources/application-local.yaml` 中的数据库和 Redis。\n2. 导入 `sql/mysql/ruoyi-vue-pro.sql`（或对应数据库方言）。\n3. 执行 `mvn -pl yudao-server -am spring-boot:run`。\n{}",
+        answers.display_name,
+        answers.project_name,
+        if answers.backend == "microservice" { "微服务" } else { "单体" },
+        answers.group_id,
+        answers.artifact_id,
+        answers.version,
+        answers.base_package,
+        answers.jdk_version,
+        answers.modules.join("`, `"),
+        port,
+        if answers.tenant_enabled { "启用" } else { "禁用" },
+        sql_note,
     );
-    fs::write(output_dir.join("README.scaffold.md"), readme)
-        .map_err(|e| format!("写入生成说明失败: {e}"))?;
-    fs::write(output_dir.join(".scaffold.json"), selected)
-        .map_err(|e| format!("写入生成配置失败: {e}"))?;
-    Ok(())
+    fs::write(backend_dir.join("README.md"), readme)
+        .map_err(|e| format!("写入项目 README 失败: {e}"))
+}
+
+fn initialize_git_repository(root: &Path, remotes: &[GitRemote]) -> Result<(), String> {
+    if remotes.is_empty() {
+        return Ok(());
+    }
+    let mut names = HashSet::new();
+    for remote in remotes {
+        let name = remote.name.trim();
+        let url = remote.url.trim();
+        if !valid_git_remote_name(name) {
+            return Err(format!("非法 Git remote 名称: {}", remote.name));
+        }
+        if url.is_empty() || url.contains(['\r', '\n']) {
+            return Err(format!("Git remote {name} 的地址为空或包含换行符"));
+        }
+        if !names.insert(name.to_string()) {
+            return Err(format!("Git remote 名称重复: {name}"));
+        }
+    }
+
+    let git_dir = root.join(".git");
+    if git_dir.exists() {
+        return Err(format!("Git 元数据目录已存在: {}", git_dir.display()));
+    }
+    for relative in ["objects", "refs/heads", "refs/tags"] {
+        fs::create_dir_all(git_dir.join(relative))
+            .map_err(|e| format!("初始化 Git 目录失败: {e}"))?;
+    }
+    fs::write(git_dir.join("HEAD"), "ref: refs/heads/main\n")
+        .map_err(|e| format!("写入 Git HEAD 失败: {e}"))?;
+
+    let mut config = format!(
+        "[core]\n\trepositoryformatversion = 0\n\tfilemode = {}\n\tbare = false\n\tlogallrefupdates = true\n",
+        if cfg!(windows) { "false" } else { "true" }
+    );
+    for remote in remotes {
+        let name = remote.name.trim();
+        config.push_str(&format!(
+            "[remote \"{}\"]\n\turl = \"{}\"\n\tfetch = +refs/heads/*:refs/remotes/{}/*\n",
+            git_config_escape(name),
+            git_config_escape(remote.url.trim()),
+            name
+        ));
+    }
+    fs::write(git_dir.join("config"), config).map_err(|e| format!("写入 Git remote 配置失败: {e}"))
+}
+
+fn valid_git_remote_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.chars().enumerate().all(|(index, character)| {
+            character.is_ascii_alphanumeric() || (index > 0 && matches!(character, '.' | '_' | '-'))
+        })
+}
+
+fn git_config_escape(value: &str) -> String {
+    value.replace('\\', "\\\\").replace('"', "\\\"")
 }
 
 fn guard_removable_output_dir(path: &Path) -> Result<(), String> {
@@ -1381,7 +2141,7 @@ fn module_meta() -> serde_json::Value {
             "crm",
             "CRM",
             "客户、商机、合同、回款等客户关系管理",
-            &["system"],
+            &["system", "bpm"],
             false,
             false,
             false,
@@ -1923,7 +2683,7 @@ mod tests {
         let application = resources.join("application.yaml");
         fs::write(
             &application,
-            "yudao:\n  tenant: # tenant settings\n    enable: true # current\n",
+            "yudao:\n  ai:\n    enabled: true\nother: value\nyudao:\n  tenant: # tenant settings\n    enable: true # current\n",
         )
         .unwrap();
         let pom = test_root.join("pom.xml");
@@ -2009,6 +2769,31 @@ mod tests {
     }
 
     #[test]
+    fn replacing_backend_preserves_everything_else_in_the_selected_parent() {
+        let test_root = unique_test_dir();
+        let backend = test_root.join("backend");
+        fs::create_dir_all(&backend).unwrap();
+        fs::write(test_root.join("keep-me.txt"), "parent content").unwrap();
+        fs::write(backend.join("old.txt"), "old backend").unwrap();
+
+        let mut staged = StagedOutputDir::new(&backend).unwrap();
+        fs::write(staged.path().join("new.txt"), "new backend").unwrap();
+        staged.commit(&backend).unwrap();
+
+        assert_eq!(
+            fs::read_to_string(test_root.join("keep-me.txt")).unwrap(),
+            "parent content"
+        );
+        assert!(!backend.join("old.txt").exists());
+        assert_eq!(
+            fs::read_to_string(backend.join("new.txt")).unwrap(),
+            "new backend"
+        );
+
+        fs::remove_dir_all(test_root).unwrap();
+    }
+
+    #[test]
     fn keeps_only_the_selected_vben_variant() {
         let test_root = unique_test_dir();
         for variant in ["antd", "antdv-next", "ele", "naive", "tdesign"] {
@@ -2054,6 +2839,347 @@ mod tests {
         );
 
         fs::remove_dir_all(test_root).unwrap();
+    }
+
+    #[test]
+    fn applies_custom_database_redis_and_removes_disabled_slave() {
+        let test_root = unique_test_dir();
+        fs::create_dir_all(&test_root).unwrap();
+        let yaml = test_root.join("application-local.yaml");
+        fs::write(
+            &yaml,
+            concat!(
+                "spring:\n",
+                "  datasource:\n",
+                "    dynamic:\n",
+                "      datasource:\n",
+                "        master:\n",
+                "          url: jdbc:mysql://127.0.0.1/default\n",
+                "          username: root\n",
+                "          password: 123456\n",
+                "        slave:\n",
+                "          lazy: true\n",
+                "          url: jdbc:mysql://127.0.0.1/default\n",
+                "          username: root\n",
+                "          password: 123456\n",
+                "  data:\n",
+                "    redis:\n",
+                "      host: 127.0.0.1\n",
+                "      port: 6379\n",
+                "      database: 0\n",
+                "#      password: dev\n",
+            ),
+        )
+        .unwrap();
+        let database = DatabaseSettings {
+            enabled: true,
+            url: "jdbc:mysql://db:3306/app?useSSL=false".into(),
+            username: "app".into(),
+            password: "db:#password".into(),
+            slave_enabled: false,
+            ..DatabaseSettings::default()
+        };
+        let redis = RedisSettings {
+            enabled: true,
+            host: "cache.local".into(),
+            port: 6380,
+            database: 2,
+            password: "redis:#password".into(),
+        };
+
+        configure_connection_profile(&yaml, &database, &redis).unwrap();
+
+        let configured = fs::read_to_string(yaml).unwrap();
+        assert!(configured.contains("url: \"jdbc:mysql://db:3306/app?useSSL=false\""));
+        assert!(configured.contains("username: \"app\""));
+        assert!(configured.contains("password: \"db:#password\""));
+        assert!(!configured.contains("        slave:"));
+        assert!(configured.contains("host: \"cache.local\""));
+        assert!(configured.contains("port: 6380"));
+        assert!(configured.contains("database: 2"));
+        assert!(configured.contains("password: \"redis:#password\""));
+
+        fs::remove_dir_all(test_root).unwrap();
+    }
+
+    #[test]
+    fn initializes_multiple_git_remotes_without_a_git_executable() {
+        let test_root = unique_test_dir();
+        fs::create_dir_all(&test_root).unwrap();
+        initialize_git_repository(&test_root, &[]).unwrap();
+        assert!(!test_root.join(".git").exists());
+        initialize_git_repository(
+            &test_root,
+            &[
+                GitRemote {
+                    name: "origin".into(),
+                    url: "https://example.com/owner/repo.git".into(),
+                },
+                GitRemote {
+                    name: "backup".into(),
+                    url: "git@example.com:owner/repo.git".into(),
+                },
+            ],
+        )
+        .unwrap();
+
+        assert_eq!(
+            fs::read_to_string(test_root.join(".git").join("HEAD")).unwrap(),
+            "ref: refs/heads/main\n"
+        );
+        let config = fs::read_to_string(test_root.join(".git").join("config")).unwrap();
+        assert!(config.contains("[remote \"origin\"]"));
+        assert!(config.contains("[remote \"backup\"]"));
+        assert!(config.contains("https://example.com/owner/repo.git"));
+        assert!(config.contains("git@example.com:owner/repo.git"));
+        let git_check = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&test_root)
+            .args(["rev-parse", "--is-inside-work-tree"])
+            .output()
+            .unwrap();
+        assert!(git_check.status.success());
+        assert_eq!(String::from_utf8_lossy(&git_check.stdout).trim(), "true");
+
+        fs::remove_dir_all(test_root).unwrap();
+    }
+
+    #[test]
+    #[ignore = "requires YUDAO_SCAFFOLD_REAL_TEMPLATE to point at a local template cache"]
+    fn generates_and_audits_real_system_infra_template() {
+        let source = std::env::var_os("YUDAO_SCAFFOLD_REAL_TEMPLATE")
+            .map(PathBuf::from)
+            .expect("YUDAO_SCAFFOLD_REAL_TEMPLATE is required");
+        let test_root = unique_test_dir();
+        let backend = test_root.join("backend");
+        copy_dir_contents(&source, &backend).unwrap();
+        clean_backend_template(&backend).unwrap();
+
+        let answers = ScaffoldAnswers {
+            project_name: "local-audit".into(),
+            display_name: "Local Audit".into(),
+            output_dir: test_root.to_string_lossy().into_owned(),
+            backend: "monolith".into(),
+            jdk_version: "17".into(),
+            group_id: "com.local.audit".into(),
+            artifact_id: "local-audit".into(),
+            version: "9.8.7-SNAPSHOT".into(),
+            base_package: "com.local.audit".into(),
+            git_remotes: vec![GitRemote {
+                name: "origin".into(),
+                url: "https://example.com/local-audit.git".into(),
+            }],
+            modules: vec!["system".into(), "infra".into()],
+            frontends: Vec::new(),
+            monolith_port: Some(49080),
+            gateway_port: Some(49080),
+            microservice_ports: HashMap::new(),
+            super_admin_username: "local-admin".into(),
+            super_admin_password: "local-audit-secret".into(),
+            database: DatabaseSettings {
+                enabled: true,
+                url: "jdbc:mysql://db.local:3306/local_audit?useSSL=false".into(),
+                username: "audit_user".into(),
+                password: "db:#secret".into(),
+                slave_enabled: false,
+                ..DatabaseSettings::default()
+            },
+            redis: RedisSettings {
+                enabled: true,
+                host: "redis.local".into(),
+                port: 6380,
+                database: 3,
+                password: "redis:#secret".into(),
+            },
+            pull_existing: true,
+            force: Some(false),
+            tenant_enabled: false,
+            vben_variant: Some("antd".into()),
+        };
+
+        prune_backend_modules(&backend, &answers.modules).unwrap();
+        let removed_rows = customize_backend_tree(&backend, &answers).unwrap();
+        write_project_readme(&backend, &answers).unwrap();
+        initialize_git_repository(&backend, &answers.git_remotes).unwrap();
+        println!("real template SQL rows removed: {removed_rows}");
+        assert!(
+            removed_rows > 0,
+            "the real template must contain removable optional-module seed rows"
+        );
+
+        let remaining_modules = fs::read_dir(&backend)
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|entry| entry.file_type().map(|kind| kind.is_dir()).unwrap_or(false))
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .filter(|name| name.starts_with("yudao-module-"))
+            .collect::<HashSet<_>>();
+        assert_eq!(
+            remaining_modules,
+            HashSet::from([
+                "yudao-module-system".to_string(),
+                "yudao-module-infra".to_string()
+            ])
+        );
+        for unwanted in ["yudao-ui", ".gitee", ".github", ".image"] {
+            assert!(!backend.join(unwanted).exists());
+        }
+        assert!(!backend
+            .join("yudao-module-infra/src/main/java/com/local/audit/module/infra/controller/admin/demo")
+            .exists());
+        assert!(!test_root.join(".scaffold.json").exists());
+        assert!(!test_root.join("README.scaffold.md").exists());
+        assert!(fs::read_to_string(backend.join("README.md"))
+            .unwrap()
+            .starts_with("# Local Audit"));
+        assert!(!test_root.join(".git").exists());
+        assert!(backend.join(".git").join("HEAD").is_file());
+        let git_config = fs::read_to_string(backend.join(".git").join("config")).unwrap();
+        assert!(git_config.contains("[remote \"origin\"]"));
+        assert!(git_config.contains("https://example.com/local-audit.git"));
+
+        let pom = fs::read_to_string(backend.join("pom.xml")).unwrap();
+        assert!(pom.contains("<groupId>com.local.audit</groupId>"));
+        assert!(pom.contains("<artifactId>local-audit</artifactId>"));
+        assert!(pom.contains("<revision>9.8.7-SNAPSHOT</revision>"));
+        assert!(pom.contains("<java.version>17</java.version>"));
+
+        let application = fs::read_to_string(
+            backend
+                .join("yudao-server")
+                .join("src")
+                .join("main")
+                .join("resources")
+                .join("application.yaml"),
+        )
+        .unwrap();
+        assert!(application.contains("  tenant: # 多租户相关配置项\n    enable: false"));
+        let local_profile = fs::read_to_string(
+            backend
+                .join("yudao-server")
+                .join("src")
+                .join("main")
+                .join("resources")
+                .join("application-local.yaml"),
+        )
+        .unwrap();
+        assert!(local_profile.contains("server:\n  port: 49080"));
+        assert!(
+            local_profile.contains("url: \"jdbc:mysql://db.local:3306/local_audit?useSSL=false\"")
+        );
+        assert!(local_profile.contains("username: \"audit_user\""));
+        assert!(local_profile.contains("password: \"db:#secret\""));
+        assert!(!local_profile.contains("        slave:"));
+        assert!(local_profile.contains("host: \"redis.local\""));
+        assert!(local_profile.contains("port: 6380"));
+        assert!(local_profile.contains("database: 3"));
+        assert!(local_profile.contains("password: \"redis:#secret\""));
+
+        audit_root_sql_has_no_unselected_business_tables(&backend.join("sql"));
+        assert_eq!(
+            filter_unselected_module_sql(&backend.join("sql"), &answers.modules).unwrap(),
+            0,
+            "SQL filtering must remove every recognizable unselected module seed row"
+        );
+        fs::remove_dir_all(test_root).unwrap();
+    }
+
+    #[test]
+    fn filters_unselected_menu_tree_dictionary_and_job_seed_rows() {
+        let test_root = unique_test_dir();
+        fs::create_dir_all(&test_root).unwrap();
+        let sql = test_root.join("seed.sql");
+        fs::write(
+            &sql,
+            concat!(
+                "INSERT INTO system_menu (id, name, permission, parent_id, path, component, component_name) VALUES (1, 'System', '', 0, '/system', NULL, NULL);\n",
+                "INSERT INTO system_menu (id, name, permission, parent_id, path, component, component_name) VALUES (10, 'Pay', '', 0, '/pay', NULL, NULL);\n",
+                "INSERT INTO system_menu (id, name, permission, parent_id, path, component, component_name) VALUES (11, 'Config', '', 10, 'config', NULL, NULL);\n",
+                "INSERT INTO system_role_menu (role_id, menu_id) VALUES (1, 11);\n",
+                "INSERT INTO system_menu (id, name, permission, parent_id, path, component, component_name) VALUES (20, 'Demo', '', 0, '/demo', NULL, NULL);\n",
+                "INSERT INTO system_menu (id, name, permission, parent_id, path, component, component_name) VALUES (21, 'Demo child', '', 20, 'child', NULL, NULL);\n",
+                "INSERT INTO system_role_menu (role_id, menu_id) VALUES (1, 21);\n",
+                "INSERT INTO system_dict_type (id, name, type) VALUES (1, 'Pay status', 'pay_status');\n",
+                "INSERT INTO system_dict_type (id, name, type) VALUES (2, 'System status', 'system_status');\n",
+                "INSERT INTO infra_job (id, name, handler_name) VALUES (1, 'Pay sync', 'paySyncJob');\n",
+                "INSERT INTO infra_job (id, name, handler_name) VALUES (2, 'System cleanup', 'systemCleanupJob');\n",
+                "INSERT INTO infra_codegen_table (id, table_name) VALUES (30, 'yudao_demo01_contact');\n",
+                "INSERT INTO infra_codegen_column (id, table_id, column_name) VALUES (31, 30, 'name');\n",
+                "-- ----------------------------\n",
+                "-- Table structure for yudao_demo01_contact\n",
+                "-- ----------------------------\n",
+                "CREATE TABLE yudao_demo01_contact (id bigint);\n",
+                "-- ----------------------------\n",
+                "-- Records of next_table\n",
+                "-- ----------------------------\n",
+            ),
+        )
+        .unwrap();
+
+        let removed =
+            filter_unselected_module_sql(&test_root, &["system".into(), "infra".into()]).unwrap();
+
+        assert!(removed >= 10);
+        let filtered = fs::read_to_string(sql).unwrap();
+        assert!(filtered.contains("VALUES (1, 'System'"));
+        assert!(filtered.contains("'system_status'"));
+        assert!(filtered.contains("'systemCleanupJob'"));
+        assert!(!filtered.contains("VALUES (10, 'Pay'"));
+        assert!(!filtered.contains("VALUES (11, 'Config'"));
+        assert!(!filtered.contains("'pay_status'"));
+        assert!(!filtered.contains("'paySyncJob'"));
+        assert!(!filtered.contains("system_role_menu"));
+        assert!(!filtered.contains("yudao_demo"));
+
+        fs::remove_dir_all(test_root).unwrap();
+    }
+
+    fn audit_root_sql_has_no_unselected_business_tables(root: &Path) {
+        const FORBIDDEN_PREFIXES: &[&str] = &[
+            "member_",
+            "bpm_",
+            "pay_",
+            "mp_",
+            "product_",
+            "promotion_",
+            "trade_",
+            "statistics_",
+            "crm_",
+            "erp_",
+            "iot_",
+            "mes_",
+            "report_",
+            "ai_",
+        ];
+        for entry in fs::read_dir(root).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                audit_root_sql_has_no_unselected_business_tables(&path);
+                continue;
+            }
+            if path.extension().and_then(|value| value.to_str()) != Some("sql") {
+                continue;
+            }
+            let text = fs::read_to_string(&path).unwrap();
+            for line in text.lines() {
+                let lower = line.to_ascii_lowercase();
+                if !lower.contains("create table") {
+                    continue;
+                }
+                assert!(
+                    !lower.contains("yudao_demo"),
+                    "{} still contains a demo table: {line}",
+                    path.display()
+                );
+                for prefix in FORBIDDEN_PREFIXES {
+                    assert!(
+                        !lower.contains(prefix),
+                        "{} contains an unselected business table: {line}",
+                        path.display()
+                    );
+                }
+            }
+        }
     }
 
     #[tokio::test]

@@ -46,6 +46,7 @@ const form = reactive<ScaffoldAnswers>({
   artifactId: 'my-app',
   version: '1.0.0-SNAPSHOT',
   basePackage: 'com.example.myapp',
+  gitRemotes: [],
   modules: ['system', 'infra'] as ModuleId[],
   frontends: ['admin-vue3'] as FrontendId[],
   monolithPort: 48080,
@@ -53,6 +54,23 @@ const form = reactive<ScaffoldAnswers>({
   microservicePorts: {},
   superAdminUsername: 'admin',
   superAdminPassword: 'admin123',
+  database: {
+    enabled: false,
+    url: '',
+    username: '',
+    password: '',
+    slaveEnabled: false,
+    slaveUrl: '',
+    slaveUsername: '',
+    slavePassword: ''
+  },
+  redis: {
+    enabled: false,
+    host: '',
+    port: 6379,
+    database: 0,
+    password: ''
+  },
   pullExisting: true,
   tenantEnabled: true,
   vbenVariant: 'antd'
@@ -237,6 +255,28 @@ const artifactIdValid = computed(() => /^[a-z][a-z0-9-]*$/.test(form.artifactId)
 const basePackageValid = computed(() =>
   /^[a-z][a-z0-9_]*(\.[a-z][a-z0-9_]*)+$/.test(form.basePackage)
 );
+const gitRemotesValid = computed(() => {
+  const names = new Set<string>();
+  return form.gitRemotes.every((remote) => {
+    const name = remote.name.trim();
+    if (!/^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(name) || !remote.url.trim() || names.has(name)) {
+      return false;
+    }
+    names.add(name);
+    return true;
+  });
+});
+const backendConnectionValid = computed(() => {
+  const databaseValid =
+    !form.database.enabled ||
+    (form.database.url.trim().length > 0 &&
+      form.database.username.trim().length > 0 &&
+      (!form.database.slaveEnabled ||
+        (form.database.slaveUrl.trim().length > 0 &&
+          form.database.slaveUsername.trim().length > 0)));
+  const redisValid = !form.redis.enabled || form.redis.host.trim().length > 0;
+  return databaseValid && redisValid;
+});
 
 const canNext = computed(() => {
   if (activeStep.value === 0) {
@@ -246,11 +286,16 @@ const canNext = computed(() => {
       form.outputDir.trim().length > 0 &&
       form.groupId.trim().length > 0 &&
       artifactIdValid.value &&
-      basePackageValid.value
+      basePackageValid.value &&
+      gitRemotesValid.value
     );
   }
   if (activeStep.value === 1) {
-    return form.superAdminUsername.length > 0 && form.superAdminPassword.length > 0;
+    return (
+      form.superAdminUsername.length > 0 &&
+      form.superAdminPassword.length > 0 &&
+      backendConnectionValid.value
+    );
   }
   return true;
 });
@@ -290,10 +335,15 @@ async function runScaffold(): Promise<void> {
   if (running.value) return;
 
   let force = false;
-  if (form.outputDir && (await pathExists(form.outputDir))) {
+  const outputBase = form.outputDir.replace(/[\\/]+$/, '');
+  const managedPaths = [`${outputBase}/backend`, `${outputBase}/frontend`];
+  const managedOutputExists = form.outputDir
+    ? (await Promise.all(managedPaths.map((path) => pathExists(path)))).some(Boolean)
+    : false;
+  if (managedOutputExists) {
     try {
       await ElMessageBox.confirm(
-        `输出目录已存在：\n${form.outputDir}\n\n新项目生成成功后才会替换该目录；如果生成失败，原内容会保留。`,
+        `所选目录中已存在 backend/ 或 frontend/：\n${form.outputDir}\n\n生成成功后只替换这两个受管理目录，其它文件不会删除。`,
         '确认强制覆盖',
         {
           type: 'warning',
@@ -355,6 +405,17 @@ function addOverride(): void {
 
 function removeOverride(idx: number): void {
   settings.urlOverrides.splice(idx, 1);
+}
+
+function addGitRemote(): void {
+  const used = new Set(form.gitRemotes.map((remote) => remote.name));
+  const preferred = ['origin', 'upstream'];
+  const name = preferred.find((candidate) => !used.has(candidate)) ?? `remote${used.size + 1}`;
+  form.gitRemotes.push({ name, url: '' });
+}
+
+function removeGitRemote(idx: number): void {
+  form.gitRemotes.splice(idx, 1);
 }
 
 let initialized = false;
@@ -427,6 +488,8 @@ export function useScaffold() {
     projectNameValid,
     artifactIdValid,
     basePackageValid,
+    gitRemotesValid,
+    backendConnectionValid,
     canNext,
 
     // module helpers
@@ -459,6 +522,8 @@ export function useScaffold() {
     runScaffold,
     resetAll,
     addOverride,
-    removeOverride
+    removeOverride,
+    addGitRemote,
+    removeGitRemote
   };
 }

@@ -56,6 +56,14 @@ const backendTpl = computed(() => templateStatus(backendTemplateName()));
       <dt>Java 包</dt>
       <dd class="mono">{{ form.basePackage }}</dd>
 
+      <dt>Git remotes</dt>
+      <dd class="tags">
+        <el-tag v-for="remote in form.gitRemotes" :key="remote.name" effect="plain">
+          {{ remote.name }}
+        </el-tag>
+        <span v-if="!form.gitRemotes.length" class="muted">不初始化 Git 仓库</span>
+      </dd>
+
       <dt>业务模块</dt>
       <dd class="tags">
         <el-tag v-for="id in form.modules" :key="id" effect="plain">{{ id }}</el-tag>
@@ -90,10 +98,19 @@ const backendTpl = computed(() => templateStatus(backendTemplateName()));
       <dt>超管</dt>
       <dd>{{ form.superAdminUsername }} / {{ '*'.repeat(form.superAdminPassword.length) }}</dd>
 
+      <dt>数据库</dt>
+      <dd>
+        {{ form.database.enabled ? '自定义主库' : '模板默认配置' }}
+        <span v-if="form.database.enabled && form.database.slaveEnabled"> · 启用从库</span>
+      </dd>
+
+      <dt>Redis</dt>
+      <dd>{{ form.redis.enabled ? `${form.redis.host}:${form.redis.port}/${form.redis.database}` : '模板默认配置' }}</dd>
+
       <dt>多租户</dt>
       <dd>
         <el-tag v-if="form.tenantEnabled" type="info" effect="plain">启用</el-tag>
-        <el-tag v-else type="warning" effect="plain">禁用 (清理租户管理代码)</el-tag>
+        <el-tag v-else type="warning" effect="plain">禁用</el-tag>
       </dd>
 
       <dt>SQL 裁剪</dt>
@@ -126,7 +143,7 @@ const backendTpl = computed(() => templateStatus(backendTemplateName()));
       class="result"
     >
       <template #title>项目已生成于 {{ finished.outputDir }}</template>
-      目录结构：<code>backend/</code> + <code>frontend/{admin,mall,dashboard}/</code><br />
+      目录结构：<code>backend/</code><template v-if="form.frontends.length"> + <code>frontend/</code></template><br />
       下一步：<code>cd {{ finished.outputDir }}/backend && mvn -pl yudao-server -am package -DskipTests</code>
     </el-alert>
 

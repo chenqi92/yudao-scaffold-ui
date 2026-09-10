@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { useScaffold } from '../../composables/useScaffold';
 
-const { form, setMicroservicePort, moduleSubName } = useScaffold();
+const { form, setMicroservicePort, moduleSubName, backendConnectionValid } = useScaffold();
 </script>
 
 <template>
@@ -34,8 +34,7 @@ const { form, setMicroservicePort, moduleSubName } = useScaffold();
           inactive-text="禁用"
         />
         <div class="field-help">
-          关闭后会设 <code>yudao.tenant.enable=false</code>，并删除租户管理表/菜单/前端页面。
-          新业务表无需 <code>tenant_id</code> 列、无需 <code>@TenantIgnore</code> 注解。
+          关闭后会设置 <code>yudao.tenant.enable=false</code>；租户表和代码会保留，便于以后恢复。
         </div>
       </el-form-item>
 
@@ -89,6 +88,86 @@ const { form, setMicroservicePort, moduleSubName } = useScaffold();
         </el-form-item>
       </template>
 
+      <div class="group-title">数据库连接</div>
+
+      <el-form-item label="自定义数据库">
+        <el-switch
+          v-model="form.database.enabled"
+          active-text="使用自定义配置"
+          inactive-text="使用模板默认配置"
+        />
+      </el-form-item>
+      <template v-if="form.database.enabled">
+        <el-form-item label="主库 JDBC URL">
+          <el-input
+            v-model="form.database.url"
+            placeholder="jdbc:mysql://127.0.0.1:3306/my_app?..."
+          />
+        </el-form-item>
+        <el-form-item label="主库账号">
+          <el-input v-model="form.database.username" placeholder="root" />
+        </el-form-item>
+        <el-form-item label="主库密码">
+          <el-input v-model="form.database.password" show-password />
+        </el-form-item>
+        <el-form-item label="启用从库">
+          <el-switch v-model="form.database.slaveEnabled" />
+        </el-form-item>
+        <template v-if="form.database.slaveEnabled">
+          <el-form-item label="从库 JDBC URL">
+            <el-input v-model="form.database.slaveUrl" placeholder="jdbc:mysql://..." />
+          </el-form-item>
+          <el-form-item label="从库账号">
+            <el-input v-model="form.database.slaveUsername" />
+          </el-form-item>
+          <el-form-item label="从库密码">
+            <el-input v-model="form.database.slavePassword" show-password />
+          </el-form-item>
+        </template>
+      </template>
+
+      <div class="group-title">Redis 连接</div>
+
+      <el-form-item label="自定义 Redis">
+        <el-switch
+          v-model="form.redis.enabled"
+          active-text="使用自定义配置"
+          inactive-text="使用模板默认配置"
+        />
+      </el-form-item>
+      <template v-if="form.redis.enabled">
+        <el-form-item label="Redis 地址">
+          <el-input v-model="form.redis.host" placeholder="127.0.0.1" />
+        </el-form-item>
+        <el-form-item label="Redis 端口">
+          <el-input-number
+            v-model="form.redis.port"
+            :min="1"
+            :max="65535"
+            controls-position="right"
+          />
+        </el-form-item>
+        <el-form-item label="Redis 数据库">
+          <el-input-number
+            v-model="form.redis.database"
+            :min="0"
+            :max="255"
+            controls-position="right"
+          />
+        </el-form-item>
+        <el-form-item label="Redis 密码">
+          <el-input v-model="form.redis.password" show-password placeholder="留空表示无密码" />
+        </el-form-item>
+      </template>
+
+      <el-alert
+        v-if="!backendConnectionValid"
+        type="error"
+        :closable="false"
+        title="请补全已启用的数据库或 Redis 配置"
+        class="connection-error"
+      />
+
       <div class="group-title">超级管理员</div>
 
       <el-form-item label="超管账号">
@@ -140,6 +219,10 @@ const { form, setMicroservicePort, moduleSubName } = useScaffold();
 
 .port-grid :deep(.el-input-number) {
   max-width: 200px;
+}
+
+.connection-error {
+  margin-bottom: 16px;
 }
 
 code {

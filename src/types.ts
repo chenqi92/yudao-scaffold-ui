@@ -16,6 +16,30 @@ export type BackendKind = 'monolith' | 'microservice';
 
 export type JdkVersion = '8' | '17';
 
+export interface GitRemote {
+  name: string;
+  url: string;
+}
+
+export interface DatabaseSettings {
+  enabled: boolean;
+  url: string;
+  username: string;
+  password: string;
+  slaveEnabled: boolean;
+  slaveUrl: string;
+  slaveUsername: string;
+  slavePassword: string;
+}
+
+export interface RedisSettings {
+  enabled: boolean;
+  host: string;
+  port: number;
+  database: number;
+  password: string;
+}
+
 export interface ModuleMeta {
   id: ModuleId;
   title: string;
@@ -73,6 +97,7 @@ export interface ScaffoldAnswers {
   artifactId: string;
   version: string;
   basePackage: string;
+  gitRemotes: GitRemote[];
   modules: ModuleId[];
   frontends: FrontendId[];
   monolithPort?: number;
@@ -80,10 +105,12 @@ export interface ScaffoldAnswers {
   microservicePorts?: Partial<Record<ModuleId, number[]>>;
   superAdminUsername: string;
   superAdminPassword: string;
+  database: DatabaseSettings;
+  redis: RedisSettings;
   pullExisting: boolean;
   /** When true, an existing output directory will be removed before generation. */
   force?: boolean;
-  /** When false, set yudao.tenant.enable=false and strip tenant management UI/SQL. */
+  /** When false, set yudao.tenant.enable=false while retaining reversible code and schema. */
   tenantEnabled: boolean;
   /** When admin-vben is chosen, which UI library variant to keep (antd / ele / naive / ...). */
   vbenVariant?: VbenVariant;
