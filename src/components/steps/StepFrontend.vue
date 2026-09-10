@@ -84,7 +84,7 @@ const {
     </div>
 
     <div class="group-title">SQL 裁剪</div>
-    <el-switch v-model="form.sqlFilter" active-text="按所选模块裁剪 SQL（保留原文为 *.full.sql 备份）" />
+    <p class="field-help">未选择模块的代码与模块内 SQL 会一并移除。</p>
 
     <div class="group-title">模板源</div>
     <el-form label-width="120px" label-position="left">

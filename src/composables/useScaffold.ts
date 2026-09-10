@@ -48,7 +48,6 @@ const form = reactive<ScaffoldAnswers>({
   basePackage: 'com.example.myapp',
   modules: ['system', 'infra'] as ModuleId[],
   frontends: ['admin-vue3'] as FrontendId[],
-  sqlFilter: true,
   monolithPort: 48080,
   gatewayPort: 48080,
   microservicePorts: {},
@@ -183,7 +182,12 @@ async function pickWorkspace(): Promise<void> {
 }
 
 function templateStatus(name: string) {
-  return meta.value?.templates.find((t) => t.name === name);
+  const template = meta.value?.templates.find((t) => t.name === name);
+  if (!template || template.kind !== 'backend') return template;
+  const variant = template.cacheVariants?.[form.jdkVersion];
+  return variant
+    ? { ...template, cachePath: variant.path, cachePresent: variant.present }
+    : template;
 }
 
 function backendTemplateName(): string {
@@ -208,14 +212,17 @@ async function refreshMeta(): Promise<void> {
   loading.value = true;
   loadError.value = '';
   try {
+    const initializeDefaults = meta.value === null;
     meta.value = await loadMeta(settings.workspaceOverride || undefined);
     loadError.value = '';
-    settings.mirror = meta.value.defaultMirror;
+    if (initializeDefaults) {
+      settings.mirror = meta.value.defaultMirror;
+      form.monolithPort = meta.value.defaultMonolithPort;
+      form.gatewayPort = meta.value.defaultGatewayPort;
+    }
     if (!form.outputDir && meta.value.workspace) {
       form.outputDir = `${meta.value.workspace}/${form.projectName}`;
     }
-    form.monolithPort = meta.value.defaultMonolithPort;
-    form.gatewayPort = meta.value.defaultGatewayPort;
   } catch (e) {
     const message = formatError(e);
     loadError.value = message;
@@ -286,11 +293,11 @@ async function runScaffold(): Promise<void> {
   if (form.outputDir && (await pathExists(form.outputDir))) {
     try {
       await ElMessageBox.confirm(
-        `输出目录已存在：\n${form.outputDir}\n\n继续将删除该目录的全部内容并重新生成，此操作不可撤销。`,
+        `输出目录已存在：\n${form.outputDir}\n\n新项目生成成功后才会替换该目录；如果生成失败，原内容会保留。`,
         '确认强制覆盖',
         {
           type: 'warning',
-          confirmButtonText: '强制覆盖',
+          confirmButtonText: '覆盖并生成',
           cancelButtonText: '取消',
           confirmButtonClass: 'el-button--danger',
           dangerouslyUseHTMLString: false
@@ -316,9 +323,10 @@ async function runScaffold(): Promise<void> {
     }, {})
   };
   try {
-    const { code } = await startScaffold(payload, appendLog);
+    const code = await startScaffold(payload, appendLog);
     if (code === 0) {
       finished.value = { ok: true, outputDir: form.outputDir };
+      await refreshMeta();
       ElMessage.success('生成完成');
     } else {
       finished.value = { ok: false, message: `引擎退出码 ${code}` };
@@ -334,7 +342,7 @@ async function runScaffold(): Promise<void> {
 }
 
 async function resetAll(): Promise<void> {
-  await ElMessageBox.confirm('清空所有输入并回到第一步?', '确认重置', { type: 'warning' });
+  await ElMessageBox.confirm('返回第一步并保留当前配置？', '继续生成', { type: 'info' });
   activeStep.value = 0;
   finished.value = null;
   logs.value = [];

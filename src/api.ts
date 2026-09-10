@@ -1,5 +1,5 @@
 import { invoke } from '@tauri-apps/api/core';
-import { listen, type UnlistenFn } from '@tauri-apps/api/event';
+import { listen } from '@tauri-apps/api/event';
 import { open } from '@tauri-apps/plugin-dialog';
 import type { RunPayload, ScaffoldEvent, ScaffoldMeta } from './types';
 
@@ -49,10 +49,6 @@ export async function pathExists(path: string): Promise<boolean> {
   return invoke<boolean>('path_exists', { path });
 }
 
-export interface RunHandle {
-  unlisten: UnlistenFn;
-}
-
 /**
  * Start the engine run. Events stream via the `scaffold-event` Tauri event;
  * the returned promise resolves with the final exit code (0 = success).
@@ -60,15 +56,13 @@ export interface RunHandle {
 export async function startScaffold(
   payload: RunPayload,
   onEvent: (e: ScaffoldEvent) => void
-): Promise<{ code: number; handle: RunHandle }> {
+): Promise<number> {
   const unlisten = await listen<ScaffoldEvent>('scaffold-event', (msg) => {
     onEvent(msg.payload);
   });
   try {
-    const code = await invoke<number>('run_scaffold', { payload });
-    return { code, handle: { unlisten } };
-  } catch (err) {
+    return await invoke<number>('run_scaffold', { payload });
+  } finally {
     unlisten();
-    throw err;
   }
 }

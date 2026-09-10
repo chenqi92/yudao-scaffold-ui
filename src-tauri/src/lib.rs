@@ -13,18 +13,22 @@ async fn path_exists(path: String) -> bool {
 #[tauri::command]
 async fn reveal_in_finder(path: String) -> Result<(), String> {
     use std::process::Command as StdCommand;
-    let result = if cfg!(target_os = "macos") {
-        StdCommand::new("open").arg(&path).status()
-    } else if cfg!(target_os = "windows") {
-        StdCommand::new("explorer").arg(&path).status()
-    } else {
-        StdCommand::new("xdg-open").arg(&path).status()
-    };
-    match result {
-        Ok(s) if s.success() => Ok(()),
-        Ok(s) => Err(format!("打开器返回非零状态: {s}")),
-        Err(e) => Err(format!("调用打开器失败: {e}")),
+    let metadata = tokio::fs::metadata(&path)
+        .await
+        .map_err(|e| format!("输出目录不存在或不可访问: {e}"))?;
+    if !metadata.is_dir() {
+        return Err("输出路径不是目录".to_string());
     }
+    let result = if cfg!(target_os = "macos") {
+        StdCommand::new("open").arg(&path).spawn()
+    } else if cfg!(target_os = "windows") {
+        StdCommand::new("explorer.exe").arg(&path).spawn()
+    } else {
+        StdCommand::new("xdg-open").arg(&path).spawn()
+    };
+    result
+        .map(|_| ())
+        .map_err(|e| format!("启动文件管理器失败: {e}"))
 }
 
 /// Set the macOS Dock icon at runtime so dev mode (which doesn't run inside a

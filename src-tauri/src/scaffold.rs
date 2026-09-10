@@ -1,6 +1,6 @@
 use serde::Deserialize;
 use serde_json::json;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs::{self, File};
 use std::io;
 use std::path::{Component, Path, PathBuf};
@@ -33,9 +33,10 @@ struct ScaffoldAnswers {
     base_package: String,
     modules: Vec<String>,
     frontends: Vec<String>,
-    sql_filter: bool,
     monolith_port: Option<u16>,
     gateway_port: Option<u16>,
+    #[serde(default)]
+    microservice_ports: HashMap<String, Vec<u16>>,
     super_admin_username: String,
     super_admin_password: String,
     pull_existing: bool,
@@ -63,6 +64,69 @@ struct RuntimePaths {
     home_dir: PathBuf,
     workspace: PathBuf,
     cache_dir: PathBuf,
+}
+
+struct StagedOutputDir {
+    path: PathBuf,
+    committed: bool,
+}
+
+impl StagedOutputDir {
+    fn new(target: &Path) -> Result<Self, String> {
+        let parent = target
+            .parent()
+            .ok_or_else(|| format!("输出目录缺少父目录: {}", target.display()))?;
+        fs::create_dir_all(parent).map_err(|e| format!("创建输出父目录失败: {e}"))?;
+        let path = unique_sibling_path(target, "staging")?;
+        fs::create_dir(&path).map_err(|e| format!("创建生成暂存目录失败: {e}"))?;
+        Ok(Self {
+            path,
+            committed: false,
+        })
+    }
+
+    fn path(&self) -> &Path {
+        &self.path
+    }
+
+    fn commit(&mut self, target: &Path) -> Result<Option<String>, String> {
+        let backup = unique_sibling_path(target, "backup")?;
+        let had_existing = target.exists();
+        if had_existing {
+            fs::rename(target, &backup).map_err(|e| format!("暂存原输出目录失败: {e}"))?;
+        }
+        if let Err(error) = fs::rename(&self.path, target) {
+            let restore_error = if had_existing {
+                fs::rename(&backup, target).err()
+            } else {
+                None
+            };
+            return Err(match restore_error {
+                Some(restore) => {
+                    format!("提交生成目录失败: {error}；恢复原输出目录也失败: {restore}")
+                }
+                None => format!("提交生成目录失败: {error}"),
+            });
+        }
+        self.committed = true;
+        if had_existing {
+            if let Err(error) = fs::remove_dir_all(&backup) {
+                return Ok(Some(format!(
+                    "新项目已生成，但旧目录备份清理失败，请手动删除 {}: {error}",
+                    backup.display()
+                )));
+            }
+        }
+        Ok(None)
+    }
+}
+
+impl Drop for StagedOutputDir {
+    fn drop(&mut self) {
+        if !self.committed {
+            let _ = fs::remove_dir_all(&self.path);
+        }
+    }
 }
 
 #[tauri::command]
@@ -93,14 +157,20 @@ pub async fn run_scaffold(app: AppHandle, payload: RunPayload) -> Result<i32, St
     if output_dir.as_os_str().is_empty() {
         return Err("请选择输出目录".to_string());
     }
+    if !output_dir.is_absolute() {
+        return Err("输出目录必须是绝对路径".to_string());
+    }
     if output_dir.exists() {
         if answers.force != Some(true) {
             return Err("输出目录已存在，请确认强制覆盖后再生成".to_string());
         }
+        if !output_dir.is_dir() {
+            return Err("输出路径已存在，但不是目录".to_string());
+        }
         guard_removable_output_dir(&output_dir)?;
-        fs::remove_dir_all(&output_dir).map_err(|e| format!("删除输出目录失败: {e}"))?;
     }
-    fs::create_dir_all(&output_dir).map_err(|e| format!("创建输出目录失败: {e}"))?;
+    let mut staged_output = StagedOutputDir::new(&output_dir)?;
+    let generation_dir = staged_output.path().to_path_buf();
 
     let mut selected_templates = Vec::new();
     selected_templates.push(if answers.backend == "microservice" {
@@ -120,7 +190,7 @@ pub async fn run_scaffold(app: AppHandle, payload: RunPayload) -> Result<i32, St
 
     let mirror = payload.mirror.as_deref().unwrap_or("gitee");
     let client = reqwest::Client::builder()
-        .user_agent("yudao-scaffold-ui/0.1")
+        .user_agent(concat!("yudao-scaffold-ui/", env!("CARGO_PKG_VERSION")))
         .build()
         .map_err(|e| format!("创建下载客户端失败: {e}"))?;
 
@@ -137,6 +207,7 @@ pub async fn run_scaffold(app: AppHandle, payload: RunPayload) -> Result<i32, St
     let backend_src = prepare_template(
         &client,
         backend_template,
+        Some(backend_template_branch(&answers.jdk_version)?),
         &paths,
         mirror,
         &payload.url_overrides,
@@ -144,9 +215,10 @@ pub async fn run_scaffold(app: AppHandle, payload: RunPayload) -> Result<i32, St
         &app,
     )
     .await?;
-    let backend_dst = output_dir.join("backend");
+    let backend_dst = generation_dir.join("backend");
     copy_dir_contents(&backend_src, &backend_dst).map_err(|e| format!("复制后端模板失败: {e}"))?;
-    customize_tree(&backend_dst, answers)?;
+    prune_backend_modules(&backend_dst, &answers.modules)?;
+    customize_backend_tree(&backend_dst, answers)?;
     emit_ok(&app, "后端模板已写入 backend/");
 
     for frontend_id in &answers.frontends {
@@ -166,6 +238,7 @@ pub async fn run_scaffold(app: AppHandle, payload: RunPayload) -> Result<i32, St
         let src = prepare_template(
             &client,
             template,
+            None,
             &paths,
             mirror,
             &payload.url_overrides,
@@ -173,9 +246,9 @@ pub async fn run_scaffold(app: AppHandle, payload: RunPayload) -> Result<i32, St
             &app,
         )
         .await?;
-        let dst = output_dir.join("frontend").join(frontend.role_suffix);
+        let dst = generation_dir.join("frontend").join(frontend.role_suffix);
         copy_dir_contents(&src, &dst).map_err(|e| format!("复制前端模板失败: {e}"))?;
-        customize_tree(&dst, answers)?;
+        customize_frontend_tree(&dst, frontend_id, answers)?;
         emit_ok(
             &app,
             &format!(
@@ -186,7 +259,11 @@ pub async fn run_scaffold(app: AppHandle, payload: RunPayload) -> Result<i32, St
     }
 
     emit_phase(&app, total - 1, total, "写入脚手架说明");
-    write_scaffold_manifest(&output_dir, &payload)?;
+    write_scaffold_manifest(&generation_dir, &payload)?;
+
+    if let Some(warning) = staged_output.commit(&output_dir)? {
+        emit_warn(&app, &warning);
+    }
 
     emit_phase(&app, total, total, "生成完成");
     emit_done(&app, &path_string(&output_dir));
@@ -196,6 +273,7 @@ pub async fn run_scaffold(app: AppHandle, payload: RunPayload) -> Result<i32, St
 async fn prepare_template(
     client: &reqwest::Client,
     template: TemplateSource,
+    branch: Option<&str>,
     paths: &RuntimePaths,
     mirror: &str,
     overrides: &HashMap<String, String>,
@@ -203,12 +281,14 @@ async fn prepare_template(
     app: &AppHandle,
 ) -> Result<PathBuf, String> {
     let local_path = paths.workspace.join(template.name);
-    if local_path.exists() {
+    if directory_has_entries(&local_path) {
         emit_info(app, &format!("使用本地模板: {}", local_path.display()));
         return Ok(local_path);
     }
 
-    let cache_path = paths.cache_dir.join(template.name);
+    let cache_path = paths
+        .cache_dir
+        .join(template_cache_dir_name(template.name, branch));
     if use_cache && directory_has_entries(&cache_path) {
         emit_info(app, &format!("使用缓存模板: {}", cache_path.display()));
         return Ok(cache_path);
@@ -229,7 +309,7 @@ async fn prepare_template(
     };
     let candidates = source_urls
         .iter()
-        .flat_map(|url| archive_url_candidates(url))
+        .flat_map(|url| archive_url_candidates(url, branch))
         .collect::<Vec<_>>();
     if candidates.is_empty() {
         return Err(format!(
@@ -351,6 +431,24 @@ fn directory_has_entries(path: &Path) -> bool {
             .unwrap_or(false)
 }
 
+fn backend_template_branch(jdk_version: &str) -> Result<&'static str, String> {
+    match jdk_version {
+        "8" => Ok("master"),
+        "17" => Ok("master-jdk17"),
+        other => Err(format!("不支持的 JDK 版本: {other}")),
+    }
+}
+
+fn template_cache_dir_name(template_name: &str, branch: Option<&str>) -> String {
+    match branch {
+        Some("master") | None => template_name.to_string(),
+        Some(branch) => format!(
+            "{template_name}-{}",
+            branch.strip_prefix("master-").unwrap_or(branch)
+        ),
+    }
+}
+
 fn extract_zip_strip_root(zip_path: &Path, destination: &Path) -> Result<(), String> {
     if destination.exists() {
         fs::remove_dir_all(destination).map_err(|e| format!("清理旧缓存失败: {e}"))?;
@@ -422,21 +520,585 @@ fn copy_dir_inner(source: &Path, destination: &Path) -> io::Result<()> {
     Ok(())
 }
 
-fn customize_tree(root: &Path, answers: &ScaffoldAnswers) -> Result<(), String> {
+const SELECTABLE_MODULES: &[&str] = &[
+    "system", "infra", "member", "bpm", "pay", "mp", "mall", "crm", "erp", "iot", "mes", "report",
+    "ai",
+];
+
+fn prune_backend_modules(root: &Path, selected_modules: &[String]) -> Result<(), String> {
+    let selected = selected_modules
+        .iter()
+        .map(String::as_str)
+        .collect::<HashSet<_>>();
+
+    for required in ["system", "infra"] {
+        if !selected.contains(required) {
+            return Err(format!("缺少必选业务模块: {required}"));
+        }
+    }
+    for module in &selected {
+        if !SELECTABLE_MODULES.contains(module) {
+            return Err(format!("未知业务模块: {module}"));
+        }
+        let module_dir = root.join(format!("yudao-module-{module}"));
+        if !module_dir.is_dir() {
+            return Err(format!(
+                "模板缺少所选业务模块目录: {}",
+                module_dir.display()
+            ));
+        }
+    }
+
+    for entry in fs::read_dir(root).map_err(|e| format!("读取后端目录失败: {e}"))? {
+        let entry = entry.map_err(|e| format!("读取后端目录项失败: {e}"))?;
+        if !entry
+            .file_type()
+            .map_err(|e| format!("读取后端目录项类型失败: {e}"))?
+            .is_dir()
+        {
+            continue;
+        }
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        let Some(module) = name.strip_prefix("yudao-module-") else {
+            continue;
+        };
+        if !selected.contains(module) {
+            fs::remove_dir_all(entry.path())
+                .map_err(|e| format!("裁剪未选模块 {name} 失败: {e}"))?;
+        }
+    }
+
+    activate_root_modules(&root.join("pom.xml"), &selected)?;
+    let server_pom = root.join("yudao-server").join("pom.xml");
+    if server_pom.is_file() {
+        activate_server_dependencies(&server_pom, &selected)?;
+    }
+    Ok(())
+}
+
+fn activate_root_modules(pom_path: &Path, selected: &HashSet<&str>) -> Result<(), String> {
+    let text = fs::read_to_string(pom_path)
+        .map_err(|e| format!("读取根 Maven POM 失败 {}: {e}", pom_path.display()))?;
+    let mut changed = false;
+    let lines = text
+        .lines()
+        .map(|line| {
+            let should_activate = selected
+                .iter()
+                .any(|module| line.contains(&format!("<module>yudao-module-{module}</module>")));
+            if should_activate && line.contains("<!--") {
+                changed = true;
+                line.replace("<!--", "").replace("-->", "")
+            } else {
+                line.to_string()
+            }
+        })
+        .collect::<Vec<_>>();
+    if changed {
+        write_lines_preserving_final_newline(pom_path, &text, lines, "写入根 Maven POM")?;
+    }
+    Ok(())
+}
+
+fn activate_server_dependencies(pom_path: &Path, selected: &HashSet<&str>) -> Result<(), String> {
+    let artifacts = selected
+        .iter()
+        .flat_map(|module| module_server_artifacts(module))
+        .collect::<HashSet<_>>();
+    let text = fs::read_to_string(pom_path)
+        .map_err(|e| format!("读取 Server Maven POM 失败 {}: {e}", pom_path.display()))?;
+    let mut lines = text.lines().map(str::to_string).collect::<Vec<_>>();
+    let mut changed = false;
+    let mut index = 0;
+    while index < lines.len() {
+        if !lines[index].contains("<dependency>") {
+            index += 1;
+            continue;
+        }
+        let end = (index..lines.len())
+            .find(|candidate| lines[*candidate].contains("</dependency>"))
+            .unwrap_or(index);
+        let should_activate = lines[index..=end].iter().any(|line| {
+            artifacts
+                .iter()
+                .any(|artifact| line.contains(&format!("<artifactId>{artifact}</artifactId>")))
+        });
+        if should_activate {
+            for line in &mut lines[index..=end] {
+                if line.contains("<!--") || line.contains("-->") {
+                    *line = line.replace("<!--", "").replace("-->", "");
+                    changed = true;
+                }
+            }
+        }
+        index = end + 1;
+    }
+    if changed {
+        write_lines_preserving_final_newline(pom_path, &text, lines, "写入 Server Maven POM")?;
+    }
+    Ok(())
+}
+
+fn module_server_artifacts(module: &str) -> &'static [&'static str] {
+    match module {
+        "mall" => &[
+            "yudao-module-product",
+            "yudao-module-promotion",
+            "yudao-module-trade",
+            "yudao-module-statistics",
+        ],
+        "iot" => &["yudao-module-iot-biz"],
+        "system" => &["yudao-module-system"],
+        "infra" => &["yudao-module-infra"],
+        "member" => &["yudao-module-member"],
+        "bpm" => &["yudao-module-bpm"],
+        "pay" => &["yudao-module-pay"],
+        "mp" => &["yudao-module-mp"],
+        "crm" => &["yudao-module-crm"],
+        "erp" => &["yudao-module-erp"],
+        "mes" => &["yudao-module-mes"],
+        "report" => &["yudao-module-report"],
+        "ai" => &["yudao-module-ai"],
+        _ => &[],
+    }
+}
+
+fn write_lines_preserving_final_newline(
+    path: &Path,
+    original: &str,
+    lines: Vec<String>,
+    action: &str,
+) -> Result<(), String> {
+    let mut updated = lines.join("\n");
+    if original.ends_with('\n') {
+        updated.push('\n');
+    }
+    fs::write(path, updated).map_err(|e| format!("{action}失败 {}: {e}", path.display()))
+}
+
+fn customize_backend_tree(root: &Path, answers: &ScaffoldAnswers) -> Result<(), String> {
     let slash_package = answers.base_package.replace('.', "/");
     let backslash_package = answers.base_package.replace('.', "\\");
+    let artifact_tag = format!("<artifactId>{}</artifactId>", answers.artifact_id);
     let replacements = [
         ("cn.iocoder.yudao", answers.base_package.as_str()),
         ("cn/iocoder/yudao", slash_package.as_str()),
         ("cn\\iocoder\\yudao", backslash_package.as_str()),
-        ("1.0.0-snapshot", answers.version.as_str()),
-        ("1.0.0-SNAPSHOT", answers.version.as_str()),
+        ("cn.iocoder.boot", answers.group_id.as_str()),
+        ("<artifactId>yudao</artifactId>", artifact_tag.as_str()),
         ("ruoyi-vue-pro", answers.project_name.as_str()),
         ("yudao-cloud", answers.project_name.as_str()),
     ];
     rewrite_text_files(root, &replacements)?;
+    set_xml_tag_value(&root.join("pom.xml"), "revision", &answers.version)?;
     relocate_java_packages(root, &answers.base_package)?;
+    configure_backend_settings(root, answers)?;
     Ok(())
+}
+
+fn customize_frontend_tree(
+    root: &Path,
+    frontend_id: &str,
+    answers: &ScaffoldAnswers,
+) -> Result<(), String> {
+    rewrite_text_files(
+        root,
+        &[
+            ("ruoyi-vue-pro", answers.project_name.as_str()),
+            ("yudao-cloud", answers.project_name.as_str()),
+        ],
+    )?;
+    if frontend_id == "admin-vben" {
+        prune_vben_variants(
+            &root.join("apps"),
+            answers.vben_variant.as_deref().unwrap_or("antd"),
+        )?;
+    }
+    Ok(())
+}
+
+fn prune_vben_variants(apps_dir: &Path, selected_variant: &str) -> Result<(), String> {
+    const VARIANTS: &[&str] = &["antd", "antdv-next", "ele", "naive", "tdesign"];
+    if !VARIANTS.contains(&selected_variant) {
+        return Err(format!("未知 Vben UI 变体: {selected_variant}"));
+    }
+    let selected_dir = apps_dir.join(format!("web-{selected_variant}"));
+    if !selected_dir.is_dir() {
+        return Err(format!("Vben 模板缺少所选变体: {}", selected_dir.display()));
+    }
+    for variant in VARIANTS {
+        if *variant == selected_variant {
+            continue;
+        }
+        let path = apps_dir.join(format!("web-{variant}"));
+        if path.exists() {
+            fs::remove_dir_all(&path)
+                .map_err(|e| format!("裁剪 Vben 变体 {} 失败: {e}", path.display()))?;
+        }
+    }
+    Ok(())
+}
+
+fn set_xml_tag_value(path: &Path, tag: &str, value: &str) -> Result<(), String> {
+    let text = fs::read_to_string(path)
+        .map_err(|e| format!("读取 XML 文件失败 {}: {e}", path.display()))?;
+    let open = format!("<{tag}>");
+    let close = format!("</{tag}>");
+    let start = text
+        .find(&open)
+        .ok_or_else(|| format!("{} 缺少 {open}", path.display()))?
+        + open.len();
+    let end = text[start..]
+        .find(&close)
+        .map(|offset| start + offset)
+        .ok_or_else(|| format!("{} 缺少 {close}", path.display()))?;
+    let mut updated = text;
+    updated.replace_range(start..end, value);
+    fs::write(path, updated).map_err(|e| format!("写入 XML 文件失败 {}: {e}", path.display()))
+}
+
+fn configure_backend_settings(root: &Path, answers: &ScaffoldAnswers) -> Result<(), String> {
+    if answers.backend == "monolith" {
+        let port = answers
+            .monolith_port
+            .ok_or_else(|| "单体项目缺少服务端口".to_string())?;
+        for profile in ["application-local.yaml", "application-dev.yaml"] {
+            set_top_level_server_port(
+                &root
+                    .join("yudao-server")
+                    .join("src")
+                    .join("main")
+                    .join("resources")
+                    .join(profile),
+                port,
+            )?;
+        }
+        set_tenant_enabled(
+            &root
+                .join("yudao-server")
+                .join("src")
+                .join("main")
+                .join("resources")
+                .join("application.yaml"),
+            answers.tenant_enabled,
+        )?;
+    } else if answers.backend == "microservice" {
+        configure_microservice_settings(root, answers)?;
+    } else {
+        return Err(format!("未知后端类型: {}", answers.backend));
+    }
+    configure_super_admin(
+        &root.join("sql"),
+        &answers.super_admin_username,
+        &answers.super_admin_password,
+    )
+}
+
+fn configure_microservice_settings(root: &Path, answers: &ScaffoldAnswers) -> Result<(), String> {
+    let gateway_port = answers
+        .gateway_port
+        .ok_or_else(|| "微服务项目缺少网关端口".to_string())?;
+    let mut used_ports = HashMap::from([(gateway_port, "gateway".to_string())]);
+    configure_microservice_port(
+        &root
+            .join("yudao-gateway")
+            .join("src")
+            .join("main")
+            .join("resources"),
+        gateway_port,
+    )?;
+
+    for module in &answers.modules {
+        let resource_dirs = microservice_resource_dirs(root, module);
+        let ports = answers
+            .microservice_ports
+            .get(module)
+            .cloned()
+            .unwrap_or_else(|| default_microservice_ports(module).to_vec());
+        if resource_dirs.len() != ports.len() {
+            return Err(format!(
+                "模块 {module} 需要 {} 个端口，但收到 {} 个",
+                resource_dirs.len(),
+                ports.len()
+            ));
+        }
+        for (index, (resources, port)) in resource_dirs.iter().zip(ports).enumerate() {
+            let owner = if resource_dirs.len() == 1 {
+                module.clone()
+            } else {
+                format!("{module}[{index}]")
+            };
+            if let Some(existing) = used_ports.insert(port, owner.clone()) {
+                return Err(format!("端口 {port} 同时分配给 {existing} 和 {owner}"));
+            }
+            configure_microservice_port(resources, port)?;
+            let _ = set_tenant_enabled_if_present(
+                &resources.join("application.yaml"),
+                answers.tenant_enabled,
+            )?;
+        }
+    }
+    Ok(())
+}
+
+fn microservice_resource_dirs(root: &Path, module: &str) -> Vec<PathBuf> {
+    let servers: &[&str] = match module {
+        "mall" => &[
+            "yudao-module-product-server",
+            "yudao-module-trade-server",
+            "yudao-module-promotion-server",
+            "yudao-module-statistics-server",
+        ],
+        "iot" => &["yudao-module-iot-server"],
+        "system" => &["yudao-module-system-server"],
+        "infra" => &["yudao-module-infra-server"],
+        "member" => &["yudao-module-member-server"],
+        "bpm" => &["yudao-module-bpm-server"],
+        "pay" => &["yudao-module-pay-server"],
+        "mp" => &["yudao-module-mp-server"],
+        "crm" => &["yudao-module-crm-server"],
+        "erp" => &["yudao-module-erp-server"],
+        "mes" => &["yudao-module-mes-server"],
+        "report" => &["yudao-module-report-server"],
+        "ai" => &["yudao-module-ai-server"],
+        _ => &[],
+    };
+    servers
+        .iter()
+        .map(|server| {
+            root.join(format!("yudao-module-{module}"))
+                .join(server)
+                .join("src")
+                .join("main")
+                .join("resources")
+        })
+        .collect()
+}
+
+fn default_microservice_ports(module: &str) -> &'static [u16] {
+    match module {
+        "system" => &[48081],
+        "infra" => &[48082],
+        "member" => &[48087],
+        "bpm" => &[48083],
+        "pay" => &[48085],
+        "mp" => &[48086],
+        "mall" => &[48100, 48102, 48101, 48103],
+        "crm" => &[48089],
+        "erp" => &[48088],
+        "iot" => &[48091],
+        "mes" => &[48092],
+        "report" => &[48084],
+        "ai" => &[48090],
+        _ => &[],
+    }
+}
+
+fn configure_microservice_port(resources: &Path, port: u16) -> Result<(), String> {
+    set_top_level_server_port(&resources.join("application.yaml"), port)?;
+    let server_dir = resources
+        .ancestors()
+        .nth(3)
+        .ok_or_else(|| format!("无法定位微服务目录: {}", resources.display()))?;
+    set_docker_expose(&server_dir.join("Dockerfile"), port)
+}
+
+fn set_docker_expose(path: &Path, port: u16) -> Result<(), String> {
+    let text = fs::read_to_string(path)
+        .map_err(|e| format!("读取 Dockerfile 失败 {}: {e}", path.display()))?;
+    let mut lines = text.lines().map(str::to_string).collect::<Vec<_>>();
+    let expose = lines
+        .iter()
+        .position(|line| line.trim_start().starts_with("EXPOSE "))
+        .ok_or_else(|| format!("{} 缺少 EXPOSE 配置", path.display()))?;
+    lines[expose] = format!("EXPOSE {port}");
+    write_lines_preserving_final_newline(path, &text, lines, "写入 Docker 端口")
+}
+
+fn set_top_level_server_port(path: &Path, port: u16) -> Result<(), String> {
+    let text = fs::read_to_string(path)
+        .map_err(|e| format!("读取服务配置失败 {}: {e}", path.display()))?;
+    let mut lines = text.lines().map(str::to_string).collect::<Vec<_>>();
+    let server_index = lines
+        .iter()
+        .position(|line| line.trim() == "server:" && !line.starts_with(char::is_whitespace))
+        .ok_or_else(|| format!("{} 缺少顶层 server 配置", path.display()))?;
+    let port_index = ((server_index + 1)..lines.len())
+        .take_while(|index| {
+            let line = &lines[*index];
+            line.trim().is_empty() || line.starts_with(char::is_whitespace)
+        })
+        .find(|index| lines[*index].trim_start().starts_with("port:"))
+        .ok_or_else(|| format!("{} 缺少 server.port 配置", path.display()))?;
+    let indent = lines[port_index]
+        .chars()
+        .take_while(|character| character.is_whitespace())
+        .collect::<String>();
+    lines[port_index] = format!("{indent}port: {port}");
+    let old_localhost = "localhost:48080";
+    let old_loopback = "127.0.0.1:48080";
+    for line in &mut lines {
+        *line = line
+            .replace(old_localhost, &format!("localhost:{port}"))
+            .replace(old_loopback, &format!("127.0.0.1:{port}"));
+    }
+    write_lines_preserving_final_newline(path, &text, lines, "写入服务端口")
+}
+
+fn set_tenant_enabled(path: &Path, enabled: bool) -> Result<(), String> {
+    if set_tenant_enabled_if_present(path, enabled)? {
+        Ok(())
+    } else {
+        Err(format!("{} 缺少 yudao.tenant 配置", path.display()))
+    }
+}
+
+fn set_tenant_enabled_if_present(path: &Path, enabled: bool) -> Result<bool, String> {
+    let text = fs::read_to_string(path)
+        .map_err(|e| format!("读取租户配置失败 {}: {e}", path.display()))?;
+    let mut lines = text.lines().map(str::to_string).collect::<Vec<_>>();
+    let Some(yudao_index) = lines
+        .iter()
+        .position(|line| line.trim() == "yudao:" && !line.starts_with(char::is_whitespace))
+    else {
+        return Ok(false);
+    };
+    let Some(tenant_index) = ((yudao_index + 1)..lines.len())
+        .take_while(|index| {
+            let line = &lines[*index];
+            line.trim().is_empty()
+                || line.trim_start().starts_with('#')
+                || line.starts_with(char::is_whitespace)
+        })
+        .find(|index| lines[*index].starts_with("  tenant:"))
+    else {
+        return Ok(false);
+    };
+    let tenant_indent = lines[tenant_index]
+        .chars()
+        .take_while(|character| character.is_whitespace())
+        .count();
+    let enable_index = ((tenant_index + 1)..lines.len())
+        .take_while(|index| {
+            let line = &lines[*index];
+            line.trim().is_empty()
+                || line
+                    .chars()
+                    .take_while(|character| character.is_whitespace())
+                    .count()
+                    > tenant_indent
+        })
+        .find(|index| lines[*index].trim_start().starts_with("enable:"))
+        .ok_or_else(|| format!("{} 缺少 yudao.tenant.enable 配置", path.display()))?;
+    let indent = lines[enable_index]
+        .chars()
+        .take_while(|character| character.is_whitespace())
+        .collect::<String>();
+    let comment = lines[enable_index]
+        .find('#')
+        .map(|index| format!(" {}", lines[enable_index][index..].trim_start()))
+        .unwrap_or_default();
+    lines[enable_index] = format!("{indent}enable: {enabled}{comment}");
+    write_lines_preserving_final_newline(path, &text, lines, "写入租户配置")?;
+    Ok(true)
+}
+
+fn configure_super_admin(sql_root: &Path, username: &str, password: &str) -> Result<(), String> {
+    if username.contains(['\r', '\n']) {
+        return Err("超管用户名不能包含换行符".to_string());
+    }
+    let password_hash =
+        bcrypt::hash(password, 10).map_err(|e| format!("生成超管密码哈希失败: {e}"))?;
+    let escaped_username = username.replace('\'', "''");
+    let mut updated_files = 0;
+    rewrite_super_admin_sql_files(
+        sql_root,
+        &escaped_username,
+        &password_hash,
+        &mut updated_files,
+    )?;
+    if updated_files == 0 {
+        return Err(format!("未在 {} 找到超管初始化 SQL", sql_root.display()));
+    }
+    Ok(())
+}
+
+fn rewrite_super_admin_sql_files(
+    root: &Path,
+    username: &str,
+    password_hash: &str,
+    updated_files: &mut usize,
+) -> Result<(), String> {
+    for entry in
+        fs::read_dir(root).map_err(|e| format!("读取 SQL 目录失败 {}: {e}", root.display()))?
+    {
+        let entry = entry.map_err(|e| format!("读取 SQL 目录项失败: {e}"))?;
+        let path = entry.path();
+        if path.is_dir() {
+            rewrite_super_admin_sql_files(&path, username, password_hash, updated_files)?;
+            continue;
+        }
+        if path.extension().and_then(|value| value.to_str()) != Some("sql") {
+            continue;
+        }
+        let text = fs::read_to_string(&path)
+            .map_err(|e| format!("读取 SQL 文件失败 {}: {e}", path.display()))?;
+        let mut changed = false;
+        let lines = text
+            .lines()
+            .map(|line| {
+                if let Some(updated) = replace_super_admin_insert(line, username, password_hash) {
+                    changed = true;
+                    updated
+                } else {
+                    line.to_string()
+                }
+            })
+            .collect::<Vec<_>>();
+        if changed {
+            write_lines_preserving_final_newline(&path, &text, lines, "写入超管初始化 SQL")?;
+            *updated_files += 1;
+        }
+    }
+    Ok(())
+}
+
+fn replace_super_admin_insert(line: &str, username: &str, password_hash: &str) -> Option<String> {
+    let lower = line.to_ascii_lowercase();
+    if !lower.contains("insert into") || !lower.contains("system_users") {
+        return None;
+    }
+    let values_index = lower
+        .find("values (1,")
+        .or_else(|| lower.find("values(1,"))?;
+    let (username_start, username_end) = sql_string_range(line, values_index)?;
+    let (password_start, password_end) = sql_string_range(line, username_end + 1)?;
+    Some(format!(
+        "{}{}{}{}{}",
+        &line[..username_start],
+        username,
+        &line[username_end..password_start],
+        password_hash,
+        &line[password_end..]
+    ))
+}
+
+fn sql_string_range(line: &str, search_from: usize) -> Option<(usize, usize)> {
+    let bytes = line.as_bytes();
+    let opening = line[search_from..].find('\'')? + search_from;
+    let mut index = opening + 1;
+    while index < bytes.len() {
+        if bytes[index] == b'\'' {
+            if bytes.get(index + 1) == Some(&b'\'') {
+                index += 2;
+                continue;
+            }
+            return Some((opening + 1, index));
+        }
+        index += 1;
+    }
+    None
 }
 
 fn rewrite_text_files(root: &Path, replacements: &[(&str, &str)]) -> Result<(), String> {
@@ -482,11 +1144,43 @@ fn relocate_java_packages(root: &Path, base_package: &str) -> Result<(), String>
             continue;
         }
         let new = java_root.join(&package_path);
-        copy_dir_contents(&old, &new).map_err(|e| format!("迁移 Java 包目录失败: {e}"))?;
-        let old_cn = java_root.join("cn");
-        if old_cn.exists() {
-            fs::remove_dir_all(old_cn).map_err(|e| format!("清理旧 Java 包目录失败: {e}"))?;
+        if new == old {
+            continue;
         }
+        if new.exists() {
+            return Err(format!("目标 Java 包目录已存在: {}", new.display()));
+        }
+        let staging = java_root.join(".yudao-package-relocation");
+        if staging.exists() {
+            return Err(format!("Java 包迁移暂存目录已存在: {}", staging.display()));
+        }
+        fs::rename(&old, &staging).map_err(|e| format!("暂存旧 Java 包目录失败: {e}"))?;
+        if let Err(error) = copy_dir_contents(&staging, &new) {
+            let _ = fs::remove_dir_all(&new);
+            let _ = fs::rename(&staging, &old);
+            return Err(format!("迁移 Java 包目录失败: {error}"));
+        }
+        fs::remove_dir_all(&staging).map_err(|e| format!("清理 Java 包暂存目录失败: {e}"))?;
+        remove_empty_package_ancestors(old.parent(), &java_root)?;
+    }
+    Ok(())
+}
+
+fn remove_empty_package_ancestors(mut current: Option<&Path>, stop: &Path) -> Result<(), String> {
+    while let Some(path) = current {
+        if path == stop || !path.starts_with(stop) {
+            break;
+        }
+        let is_empty = fs::read_dir(path)
+            .map_err(|e| format!("检查旧 Java 包目录失败 {}: {e}", path.display()))?
+            .next()
+            .is_none();
+        if !is_empty {
+            break;
+        }
+        fs::remove_dir(path)
+            .map_err(|e| format!("清理旧 Java 包目录失败 {}: {e}", path.display()))?;
+        current = path.parent();
     }
     Ok(())
 }
@@ -528,12 +1222,12 @@ fn write_scaffold_manifest(output_dir: &Path, payload: &RunPayload) -> Result<()
         "basePackage": &answers.base_package,
         "modules": &answers.modules,
         "frontends": &answers.frontends,
-        "sqlFilter": answers.sql_filter,
         "tenantEnabled": answers.tenant_enabled,
         "superAdminUsername": &answers.super_admin_username,
-        "superAdminPassword": &answers.super_admin_password,
+        "superAdminPasswordConfigured": !answers.super_admin_password.is_empty(),
         "monolithPort": answers.monolith_port,
         "gatewayPort": answers.gateway_port,
+        "microservicePorts": &answers.microservice_ports,
         "vbenVariant": &answers.vben_variant,
         "mirror": &payload.mirror,
     }))
@@ -562,6 +1256,24 @@ fn guard_removable_output_dir(path: &Path) -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+fn unique_sibling_path(target: &Path, kind: &str) -> Result<PathBuf, String> {
+    let parent = target
+        .parent()
+        .ok_or_else(|| format!("路径缺少父目录: {}", target.display()))?;
+    let name = target
+        .file_name()
+        .and_then(|value| value.to_str())
+        .ok_or_else(|| format!("路径缺少有效目录名: {}", target.display()))?;
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|e| format!("系统时间异常: {e}"))?
+        .as_nanos();
+    Ok(parent.join(format!(
+        ".{name}.yudao-scaffold-{kind}-{}-{nonce}",
+        std::process::id()
+    )))
 }
 
 fn runtime_paths(workspace: Option<String>) -> Result<RuntimePaths, String> {
@@ -618,7 +1330,7 @@ fn module_meta() -> serde_json::Value {
             false,
             false,
             false,
-            &[48083],
+            &[48087],
             None
         ),
         module(
@@ -629,7 +1341,7 @@ fn module_meta() -> serde_json::Value {
             false,
             false,
             false,
-            &[48084],
+            &[48083],
             None
         ),
         module(
@@ -662,7 +1374,7 @@ fn module_meta() -> serde_json::Value {
             true,
             false,
             false,
-            &[48087, 48088, 48089, 48090],
+            &[48100, 48102, 48101, 48103],
             Some(&["product", "trade", "promotion", "statistics"])
         ),
         module(
@@ -673,7 +1385,7 @@ fn module_meta() -> serde_json::Value {
             false,
             false,
             false,
-            &[48091],
+            &[48089],
             None
         ),
         module(
@@ -684,7 +1396,7 @@ fn module_meta() -> serde_json::Value {
             false,
             false,
             false,
-            &[48092],
+            &[48088],
             None
         ),
         module(
@@ -695,7 +1407,7 @@ fn module_meta() -> serde_json::Value {
             false,
             false,
             false,
-            &[48093],
+            &[48091],
             None
         ),
         module(
@@ -706,7 +1418,7 @@ fn module_meta() -> serde_json::Value {
             false,
             false,
             false,
-            &[48094],
+            &[48092],
             None
         ),
         module(
@@ -717,7 +1429,7 @@ fn module_meta() -> serde_json::Value {
             false,
             false,
             false,
-            &[48095],
+            &[48084],
             None
         ),
         module(
@@ -728,7 +1440,7 @@ fn module_meta() -> serde_json::Value {
             false,
             true,
             false,
-            &[48096],
+            &[48090],
             None
         )
     ])
@@ -843,13 +1555,30 @@ fn template_meta(paths: &RuntimePaths) -> serde_json::Value {
         .map(|template| {
             let local = paths.workspace.join(template.name);
             let cache = paths.cache_dir.join(template.name);
+            let jdk17_cache = paths
+                .cache_dir
+                .join(template_cache_dir_name(template.name, Some("master-jdk17")));
             json!({
                 "name": template.name,
                 "kind": template.kind,
                 "localPath": path_string(&local),
-                "localPresent": local.exists(),
+                "localPresent": directory_has_entries(&local),
                 "cachePath": path_string(&cache),
-                "cachePresent": cache.exists(),
+                "cachePresent": directory_has_entries(&cache),
+                "cacheVariants": if template.kind == "backend" {
+                    json!({
+                        "8": {
+                            "path": path_string(&cache),
+                            "present": directory_has_entries(&cache),
+                        },
+                        "17": {
+                            "path": path_string(&jdk17_cache),
+                            "present": directory_has_entries(&jdk17_cache),
+                        }
+                    })
+                } else {
+                    serde_json::Value::Null
+                },
                 "gitee": template.gitee,
                 "github": template.github,
                 "isGitRepo": false
@@ -952,19 +1681,22 @@ fn frontend_source(id: &str) -> Option<FrontendSource> {
     .find(|f| f.id == id)
 }
 
-fn archive_url_candidates(url: &str) -> Vec<String> {
+fn archive_url_candidates(url: &str, branch: Option<&str>) -> Vec<String> {
     let trimmed = url.trim().trim_end_matches(".git").trim_end_matches('/');
     if trimmed.ends_with(".zip") {
         return vec![trimmed.to_string()];
     }
+    let branches = branch
+        .map(|branch| vec![branch])
+        .unwrap_or_else(|| vec!["master", "main"]);
     if trimmed.contains("github.com/") {
-        return ["master", "main"]
+        return branches
             .iter()
             .map(|branch| format!("{trimmed}/archive/refs/heads/{branch}.zip"))
             .collect();
     }
     if trimmed.contains("gitee.com/") {
-        return ["master", "main"]
+        return branches
             .iter()
             .map(|branch| format!("{trimmed}/repository/archive/{branch}.zip"))
             .collect();
@@ -973,11 +1705,24 @@ fn archive_url_candidates(url: &str) -> Vec<String> {
 }
 
 fn should_rewrite_file(path: &Path) -> bool {
-    match path.extension().and_then(|s| s.to_str()).unwrap_or("") {
-        "java" | "kt" | "xml" | "yml" | "yaml" | "properties" | "md" | "json" | "ts" | "js"
-        | "vue" | "html" | "sql" | "env" | "txt" => true,
-        _ => false,
-    }
+    matches!(
+        path.extension().and_then(|s| s.to_str()).unwrap_or(""),
+        "java"
+            | "kt"
+            | "xml"
+            | "yml"
+            | "yaml"
+            | "properties"
+            | "md"
+            | "json"
+            | "ts"
+            | "js"
+            | "vue"
+            | "html"
+            | "sql"
+            | "env"
+            | "txt"
+    )
 }
 
 fn strip_first_component(path: &Path) -> PathBuf {
@@ -1050,19 +1795,265 @@ mod tests {
     #[test]
     fn builds_master_and_main_archive_candidates() {
         assert_eq!(
-            archive_url_candidates("https://github.com/example/repo.git"),
+            archive_url_candidates("https://github.com/example/repo.git", None),
             vec![
                 "https://github.com/example/repo/archive/refs/heads/master.zip",
                 "https://github.com/example/repo/archive/refs/heads/main.zip",
             ]
         );
         assert_eq!(
-            archive_url_candidates("https://gitee.com/example/repo.git"),
+            archive_url_candidates("https://gitee.com/example/repo.git", None),
             vec![
                 "https://gitee.com/example/repo/repository/archive/master.zip",
                 "https://gitee.com/example/repo/repository/archive/main.zip",
             ]
         );
+        assert_eq!(
+            archive_url_candidates("https://github.com/example/repo.git", Some("master-jdk17")),
+            vec!["https://github.com/example/repo/archive/refs/heads/master-jdk17.zip"]
+        );
+        assert_eq!(backend_template_branch("8").unwrap(), "master");
+        assert_eq!(backend_template_branch("17").unwrap(), "master-jdk17");
+        assert_eq!(
+            template_cache_dir_name("ruoyi-vue-pro", Some("master-jdk17")),
+            "ruoyi-vue-pro-jdk17"
+        );
+    }
+
+    #[test]
+    fn keeps_only_system_and_infra_when_they_are_the_only_selection() {
+        let test_root = unique_test_dir();
+        fs::create_dir_all(test_root.join("yudao-server")).unwrap();
+        for module in ["system", "infra", "member", "ai", "wms"] {
+            fs::create_dir_all(test_root.join(format!("yudao-module-{module}"))).unwrap();
+        }
+        fs::write(
+            test_root.join("pom.xml"),
+            r#"<modules>
+  <module>yudao-module-system</module>
+  <module>yudao-module-infra</module>
+<!--  <module>yudao-module-member</module>-->
+<!--  <module>yudao-module-ai</module>-->
+</modules>
+"#,
+        )
+        .unwrap();
+        fs::write(
+            test_root.join("yudao-server").join("pom.xml"),
+            r#"<dependencies>
+<!--  <dependency>-->
+<!--    <artifactId>yudao-module-member</artifactId>-->
+<!--  </dependency>-->
+<!--  <dependency>-->
+<!--    <artifactId>yudao-module-ai</artifactId>-->
+<!--  </dependency>-->
+</dependencies>
+"#,
+        )
+        .unwrap();
+
+        let selected = vec!["system".into(), "infra".into()];
+        prune_backend_modules(&test_root, &selected).unwrap();
+
+        assert!(test_root.join("yudao-module-system").is_dir());
+        assert!(test_root.join("yudao-module-infra").is_dir());
+        assert!(!test_root.join("yudao-module-member").exists());
+        assert!(!test_root.join("yudao-module-ai").exists());
+        assert!(!test_root.join("yudao-module-wms").exists());
+
+        let root_pom = fs::read_to_string(test_root.join("pom.xml")).unwrap();
+        assert!(root_pom.contains("<!--  <module>yudao-module-member</module>-->"));
+        assert!(root_pom.contains("<!--  <module>yudao-module-ai</module>-->"));
+        let server_pom =
+            fs::read_to_string(test_root.join("yudao-server").join("pom.xml")).unwrap();
+        assert!(server_pom.contains("<!--    <artifactId>yudao-module-member</artifactId>-->"));
+        assert!(server_pom.contains("<!--    <artifactId>yudao-module-ai</artifactId>-->"));
+
+        fs::remove_dir_all(test_root).unwrap();
+    }
+
+    #[test]
+    fn activates_a_selected_optional_module_in_both_poms() {
+        let test_root = unique_test_dir();
+        fs::create_dir_all(test_root.join("yudao-server")).unwrap();
+        for module in ["system", "infra", "member"] {
+            fs::create_dir_all(test_root.join(format!("yudao-module-{module}"))).unwrap();
+        }
+        fs::write(
+            test_root.join("pom.xml"),
+            "<module>yudao-module-system</module>\n<module>yudao-module-infra</module>\n<!-- <module>yudao-module-member</module> -->\n",
+        )
+        .unwrap();
+        fs::write(
+            test_root.join("yudao-server").join("pom.xml"),
+            "<!-- <dependency> -->\n<!-- <artifactId>yudao-module-member</artifactId> -->\n<!-- </dependency> -->\n",
+        )
+        .unwrap();
+
+        prune_backend_modules(
+            &test_root,
+            &["system".into(), "infra".into(), "member".into()],
+        )
+        .unwrap();
+
+        let root_pom = fs::read_to_string(test_root.join("pom.xml")).unwrap();
+        assert!(root_pom.contains("<module>yudao-module-member</module>"));
+        assert!(!root_pom.contains("<!-- <module>yudao-module-member"));
+        let server_pom =
+            fs::read_to_string(test_root.join("yudao-server").join("pom.xml")).unwrap();
+        assert!(server_pom.contains("<artifactId>yudao-module-member</artifactId>"));
+        assert!(!server_pom.contains("<!-- <artifactId>yudao-module-member"));
+
+        fs::remove_dir_all(test_root).unwrap();
+    }
+
+    #[test]
+    fn applies_maven_port_tenant_and_super_admin_settings() {
+        let test_root = unique_test_dir();
+        let resources = test_root.join("resources");
+        let sql_dir = test_root.join("sql");
+        fs::create_dir_all(&resources).unwrap();
+        fs::create_dir_all(&sql_dir).unwrap();
+        let profile = resources.join("application-local.yaml");
+        fs::write(
+            &profile,
+            "server:\n  port: 48080\nsecurity:\n  frame: localhost:48080 127.0.0.1:48080\n",
+        )
+        .unwrap();
+        let application = resources.join("application.yaml");
+        fs::write(
+            &application,
+            "yudao:\n  tenant: # tenant settings\n    enable: true # current\n",
+        )
+        .unwrap();
+        let pom = test_root.join("pom.xml");
+        fs::write(&pom, "<properties><revision>old</revision></properties>\n").unwrap();
+        let sql = sql_dir.join("schema.sql");
+        fs::write(
+            &sql,
+            "INSERT INTO system_users (id, username, password) VALUES (1, N'admin', N'old-hash');\n",
+        )
+        .unwrap();
+
+        set_top_level_server_port(&profile, 49090).unwrap();
+        set_tenant_enabled(&application, false).unwrap();
+        set_xml_tag_value(&pom, "revision", "2.3.4-SNAPSHOT").unwrap();
+        configure_super_admin(&sql_dir, "root'user", "new-secret").unwrap();
+
+        let profile_text = fs::read_to_string(profile).unwrap();
+        assert!(profile_text.contains("port: 49090"));
+        assert!(profile_text.contains("localhost:49090 127.0.0.1:49090"));
+        assert!(fs::read_to_string(application)
+            .unwrap()
+            .contains("enable: false # current"));
+        assert!(fs::read_to_string(pom)
+            .unwrap()
+            .contains("<revision>2.3.4-SNAPSHOT</revision>"));
+        let sql_text = fs::read_to_string(sql).unwrap();
+        assert!(sql_text.contains("N'root''user'"));
+        let (_, username_end) =
+            sql_string_range(&sql_text, sql_text.find("VALUES").unwrap()).unwrap();
+        let (password_start, password_end) = sql_string_range(&sql_text, username_end + 1).unwrap();
+        assert!(bcrypt::verify("new-secret", &sql_text[password_start..password_end]).unwrap());
+
+        fs::remove_dir_all(test_root).unwrap();
+    }
+
+    #[test]
+    fn relocates_java_packages_without_deleting_cn_targets_or_recursing() {
+        for base_package in ["cn.example.app", "cn.iocoder.yudao.child"] {
+            let test_root = unique_test_dir();
+            let java_root = test_root
+                .join("module")
+                .join("src")
+                .join("main")
+                .join("java");
+            let old_package = java_root.join("cn").join("iocoder").join("yudao");
+            fs::create_dir_all(&old_package).unwrap();
+            fs::write(old_package.join("Example.java"), "class Example {}\n").unwrap();
+
+            relocate_java_packages(&test_root, base_package).unwrap();
+
+            let new_package =
+                java_root.join(base_package.replace('.', std::path::MAIN_SEPARATOR_STR));
+            assert_eq!(
+                fs::read_to_string(new_package.join("Example.java")).unwrap(),
+                "class Example {}\n"
+            );
+            assert!(!java_root.join(".yudao-package-relocation").exists());
+
+            fs::remove_dir_all(test_root).unwrap();
+        }
+    }
+
+    #[test]
+    fn staged_output_preserves_existing_content_until_commit() {
+        let test_root = unique_test_dir();
+        let target = test_root.join("project");
+        fs::create_dir_all(&target).unwrap();
+        fs::write(target.join("old.txt"), "old").unwrap();
+
+        {
+            let staged = StagedOutputDir::new(&target).unwrap();
+            fs::write(staged.path().join("abandoned.txt"), "abandoned").unwrap();
+        }
+        assert_eq!(fs::read_to_string(target.join("old.txt")).unwrap(), "old");
+
+        let mut staged = StagedOutputDir::new(&target).unwrap();
+        fs::write(staged.path().join("new.txt"), "new").unwrap();
+        assert!(staged.commit(&target).unwrap().is_none());
+        assert!(!target.join("old.txt").exists());
+        assert_eq!(fs::read_to_string(target.join("new.txt")).unwrap(), "new");
+
+        fs::remove_dir_all(test_root).unwrap();
+    }
+
+    #[test]
+    fn keeps_only_the_selected_vben_variant() {
+        let test_root = unique_test_dir();
+        for variant in ["antd", "antdv-next", "ele", "naive", "tdesign"] {
+            fs::create_dir_all(test_root.join(format!("web-{variant}"))).unwrap();
+        }
+
+        prune_vben_variants(&test_root, "ele").unwrap();
+
+        assert!(test_root.join("web-ele").is_dir());
+        assert!(!test_root.join("web-antd").exists());
+        assert!(!test_root.join("web-antdv-next").exists());
+        assert!(!test_root.join("web-naive").exists());
+        assert!(!test_root.join("web-tdesign").exists());
+
+        fs::remove_dir_all(test_root).unwrap();
+    }
+
+    #[test]
+    fn applies_microservice_port_to_yaml_and_dockerfile() {
+        let test_root = unique_test_dir();
+        let server = test_root.join("module-server");
+        let resources = server.join("src").join("main").join("resources");
+        fs::create_dir_all(&resources).unwrap();
+        fs::write(
+            resources.join("application.yaml"),
+            "spring:\n  application:\n    name: demo\nserver:\n  port: 48081\n",
+        )
+        .unwrap();
+        fs::write(server.join("Dockerfile"), "FROM scratch\nEXPOSE 48081\n").unwrap();
+
+        configure_microservice_port(&resources, 49101).unwrap();
+
+        assert!(fs::read_to_string(resources.join("application.yaml"))
+            .unwrap()
+            .contains("port: 49101"));
+        assert!(fs::read_to_string(server.join("Dockerfile"))
+            .unwrap()
+            .contains("EXPOSE 49101"));
+        assert_eq!(default_microservice_ports("member"), &[48087]);
+        assert_eq!(
+            default_microservice_ports("mall"),
+            &[48100, 48102, 48101, 48103]
+        );
+
+        fs::remove_dir_all(test_root).unwrap();
     }
 
     #[tokio::test]

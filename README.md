@@ -46,9 +46,9 @@ pnpm tauri:build
 ```
 
 产物位于 `src-tauri/target/release/bundle/`：
-- macOS: `dmg/yudao-scaffold_0.1.1_aarch64.dmg`（~10 MB）
-- Windows: `msi/yudao-scaffold_0.1.1_x64_en-US.msi`
-- Linux: `deb/yudao-scaffold_0.1.1_amd64.deb` + `appimage/...`
+- macOS: `dmg/yudao-scaffold_0.1.2_aarch64.dmg`（~10 MB）
+- Windows: `msi/yudao-scaffold_0.1.2_x64_en-US.msi`
+- Linux: `deb/yudao-scaffold_0.1.2_amd64.deb` + `appimage/...`
 
 跨平台打包必须在对应平台系统上执行（macOS dmg 必须 macOS 出包，Windows msi 必须 Windows 出包）。
 

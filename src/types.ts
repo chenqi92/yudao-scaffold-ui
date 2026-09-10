@@ -45,6 +45,7 @@ export interface TemplatePresence {
   localPresent: boolean;
   cachePath: string;
   cachePresent: boolean;
+  cacheVariants?: Partial<Record<JdkVersion, { path: string; present: boolean }>>;
   gitee: string;
   github: string;
   isGitRepo: boolean;
@@ -74,7 +75,6 @@ export interface ScaffoldAnswers {
   basePackage: string;
   modules: ModuleId[];
   frontends: FrontendId[];
-  sqlFilter: boolean;
   monolithPort?: number;
   gatewayPort?: number;
   microservicePorts?: Partial<Record<ModuleId, number[]>>;

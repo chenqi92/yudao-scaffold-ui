@@ -97,7 +97,7 @@ const backendTpl = computed(() => templateStatus(backendTemplateName()));
       </dd>
 
       <dt>SQL 裁剪</dt>
-      <dd>{{ form.sqlFilter ? '是' : '否' }}</dd>
+      <dd>随业务模块一并裁剪</dd>
 
       <dt>模板缓存</dt>
       <dd>{{ form.pullExisting ? '优先使用' : '重新下载' }}</dd>

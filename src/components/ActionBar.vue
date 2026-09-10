@@ -66,7 +66,7 @@ async function openOutputDir() {
     <div class="buttons">
       <!-- finished error: reset + retry -->
       <template v-if="finished?.message && !finished?.ok">
-        <el-button :icon="RefreshLeft" :disabled="running" @click="resetAll">重置</el-button>
+        <el-button :icon="RefreshLeft" :disabled="running" @click="resetAll">返回修改</el-button>
         <el-button
           type="primary"
           :icon="VideoPlay"
