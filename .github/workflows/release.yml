@@ -61,6 +61,18 @@ jobs:
           echo "version=$package_version" >> "$GITHUB_OUTPUT"
           echo "tag=v$package_version" >> "$GITHUB_OUTPUT"
 
+      - name: Verify updater signing secrets
+        shell: bash
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          if [[ -z "$TAURI_SIGNING_PRIVATE_KEY" || -z "$TAURI_SIGNING_PRIVATE_KEY_PASSWORD" ]]; then
+            echo "Missing TAURI_SIGNING_PRIVATE_KEY or TAURI_SIGNING_PRIVATE_KEY_PASSWORD." >&2
+            exit 1
+          fi
+
       - name: Check whether release tag exists
         id: release
         shell: bash
@@ -123,7 +135,7 @@ jobs:
           - platform: macos-latest
             args: --target x86_64-apple-darwin --bundles app,dmg
           - platform: ubuntu-22.04
-            args: --bundles deb,rpm
+            args: --bundles appimage,deb,rpm
           - platform: windows-latest
             args: --bundles msi,nsis
     runs-on: ${{ matrix.platform }}
@@ -134,7 +146,7 @@ jobs:
         if: matrix.platform == 'ubuntu-22.04'
         run: |
           sudo apt-get update
-          sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf xdg-utils
 
       - name: Setup pnpm
         uses: pnpm/action-setup@v4
@@ -161,9 +173,12 @@ jobs:
         run: pnpm install --frozen-lockfile
 
       - name: Build and upload release assets
-        uses: tauri-apps/tauri-action@v0.6.2
+        uses: tauri-apps/tauri-action@v1
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ matrix.platform == 'macos-latest' && '-' || '' }}
         with:
           tagName: ${{ needs.version.outputs.tag }}
           releaseName: yudao-scaffold ${{ needs.version.outputs.tag }}
@@ -173,4 +188,6 @@ jobs:
           generateReleaseNotes: true
           tauriScript: pnpm tauri
           args: ${{ matrix.args }}
-          assetNamePattern: '[name]-[version]-[platform]-[arch][setup].[ext]'
+          uploadUpdaterJson: true
+          updaterJsonPreferNsis: true
+          releaseAssetNamePattern: '[name]-[version]-[platform]-[arch][setup].[ext]'

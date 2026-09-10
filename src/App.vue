@@ -9,6 +9,7 @@ import StepBackend from './components/steps/StepBackend.vue';
 import StepModules from './components/steps/StepModules.vue';
 import StepFrontend from './components/steps/StepFrontend.vue';
 import StepExecute from './components/steps/StepExecute.vue';
+import { checkForAppUpdate } from './updater';
 
 const { activeStep, init } = useScaffold();
 
@@ -23,7 +24,10 @@ const stepComponent = computed(() => {
   }
 });
 
-onMounted(init);
+onMounted(async () => {
+  await init();
+  void checkForAppUpdate();
+});
 </script>
 
 <template>

@@ -209,24 +209,33 @@ async fn prepare_template(
     }
 
     let cache_path = paths.cache_dir.join(template.name);
-    if use_cache && cache_path.exists() {
+    if use_cache && directory_has_entries(&cache_path) {
         emit_info(app, &format!("使用缓存模板: {}", cache_path.display()));
         return Ok(cache_path);
     }
+    if cache_path.exists() {
+        emit_warn(
+            app,
+            &format!("忽略不完整的模板缓存: {}", cache_path.display()),
+        );
+    }
 
-    let source_url = overrides
-        .get(template.name)
-        .map(String::as_str)
-        .unwrap_or_else(|| {
-            if mirror == "github" {
-                template.github
-            } else {
-                template.gitee
-            }
-        });
-    let candidates = archive_url_candidates(source_url);
+    let source_urls = if let Some(url_override) = overrides.get(template.name) {
+        vec![url_override.as_str()]
+    } else if mirror == "github" {
+        vec![template.github, template.gitee]
+    } else {
+        vec![template.gitee, template.github]
+    };
+    let candidates = source_urls
+        .iter()
+        .flat_map(|url| archive_url_candidates(url))
+        .collect::<Vec<_>>();
     if candidates.is_empty() {
-        return Err(format!("无法从模板地址生成下载链接: {source_url}"));
+        return Err(format!(
+            "无法从模板地址生成下载链接: {}",
+            source_urls.join(", ")
+        ));
     }
 
     emit_info(app, &format!("下载模板 {} ...", template.name));
@@ -252,38 +261,94 @@ async fn download_and_extract(
             .and_then(|s| s.to_str())
             .unwrap_or("template")
     ));
+    let staging_path = parent.join(format!(
+        ".{}.extracting",
+        destination
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("template")
+    ));
 
-    let mut last_error = String::new();
+    let mut errors = Vec::new();
     for url in candidates {
         match client.get(url).send().await {
             Ok(resp) if resp.status().is_success() => {
-                let bytes = resp
-                    .bytes()
-                    .await
-                    .map_err(|e| format!("读取模板响应失败: {e}"))?;
+                let content_type = resp
+                    .headers()
+                    .get(reqwest::header::CONTENT_TYPE)
+                    .and_then(|value| value.to_str().ok())
+                    .unwrap_or("未知")
+                    .to_string();
+                let bytes = match resp.bytes().await {
+                    Ok(bytes) => bytes,
+                    Err(e) => {
+                        errors.push(format!("{url} 读取响应失败: {e}"));
+                        continue;
+                    }
+                };
+                if !has_zip_signature(&bytes) {
+                    errors.push(format!(
+                        "{url} 返回的不是 ZIP（Content-Type: {content_type}，{} 字节）",
+                        bytes.len()
+                    ));
+                    continue;
+                }
                 tokio::fs::write(&zip_path, &bytes)
                     .await
                     .map_err(|e| format!("写入模板压缩包失败: {e}"))?;
                 let zip_path_clone = zip_path.clone();
-                let destination_clone = destination.to_path_buf();
-                tokio::task::spawn_blocking(move || {
-                    extract_zip_strip_root(&zip_path_clone, &destination_clone)
+                let staging_path_clone = staging_path.clone();
+                let extraction = tokio::task::spawn_blocking(move || {
+                    extract_zip_strip_root(&zip_path_clone, &staging_path_clone)
                 })
-                .await
-                .map_err(|e| format!("解压任务失败: {e}"))??;
+                .await;
+                match extraction {
+                    Ok(Ok(())) => {
+                        if destination.exists() {
+                            fs::remove_dir_all(destination)
+                                .map_err(|e| format!("清理旧缓存失败: {e}"))?;
+                        }
+                        fs::rename(&staging_path, destination)
+                            .map_err(|e| format!("提交模板缓存失败: {e}"))?;
+                        let _ = fs::remove_file(&zip_path);
+                        return Ok(());
+                    }
+                    Ok(Err(e)) => {
+                        errors.push(format!("{url} 解压失败: {e}"));
+                    }
+                    Err(e) => {
+                        errors.push(format!("{url} 解压任务失败: {e}"));
+                    }
+                }
+                let _ = fs::remove_dir_all(&staging_path);
                 let _ = fs::remove_file(&zip_path);
-                return Ok(());
             }
             Ok(resp) => {
-                last_error = format!("{url} 返回 HTTP {}", resp.status());
+                errors.push(format!("{url} 返回 HTTP {}", resp.status()));
             }
             Err(e) => {
-                last_error = format!("{url} 下载失败: {e}");
+                errors.push(format!("{url} 下载失败: {e}"));
             }
         }
     }
 
-    Err(format!("模板下载失败: {last_error}"))
+    let _ = fs::remove_dir_all(&staging_path);
+    let _ = fs::remove_file(&zip_path);
+    Err(format!("模板下载失败: {}", errors.join("；")))
+}
+
+fn has_zip_signature(bytes: &[u8]) -> bool {
+    matches!(
+        bytes.get(..4),
+        Some([b'P', b'K', 3, 4] | [b'P', b'K', 5, 6] | [b'P', b'K', 7, 8])
+    )
+}
+
+fn directory_has_entries(path: &Path) -> bool {
+    path.is_dir()
+        && fs::read_dir(path)
+            .map(|mut entries| entries.next().is_some())
+            .unwrap_or(false)
 }
 
 fn extract_zip_strip_root(zip_path: &Path, destination: &Path) -> Result<(), String> {
@@ -962,4 +1027,109 @@ fn emit_done(app: &AppHandle, output_dir: &str) {
         "scaffold-event",
         json!({ "type": "done", "outputDir": output_dir }),
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::{Cursor, Write};
+    use std::time::{SystemTime, UNIX_EPOCH};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+    use zip::write::SimpleFileOptions;
+
+    #[test]
+    fn recognizes_supported_zip_signatures() {
+        assert!(has_zip_signature(b"PK\x03\x04archive"));
+        assert!(has_zip_signature(b"PK\x05\x06empty"));
+        assert!(has_zip_signature(b"PK\x07\x08spanned"));
+        assert!(!has_zip_signature(b"<!doctype html>"));
+        assert!(!has_zip_signature(b"PK"));
+    }
+
+    #[test]
+    fn builds_master_and_main_archive_candidates() {
+        assert_eq!(
+            archive_url_candidates("https://github.com/example/repo.git"),
+            vec![
+                "https://github.com/example/repo/archive/refs/heads/master.zip",
+                "https://github.com/example/repo/archive/refs/heads/main.zip",
+            ]
+        );
+        assert_eq!(
+            archive_url_candidates("https://gitee.com/example/repo.git"),
+            vec![
+                "https://gitee.com/example/repo/repository/archive/master.zip",
+                "https://gitee.com/example/repo/repository/archive/main.zip",
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn falls_back_when_a_successful_response_is_not_a_zip() {
+        let zip_bytes = test_zip();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            for response_body in [b"<!doctype html>blocked".to_vec(), zip_bytes] {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut request = [0_u8; 1024];
+                let _ = socket.read(&mut request).await.unwrap();
+                let content_type = if has_zip_signature(&response_body) {
+                    "application/zip"
+                } else {
+                    "text/html"
+                };
+                let headers = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    response_body.len()
+                );
+                socket.write_all(headers.as_bytes()).await.unwrap();
+                socket.write_all(&response_body).await.unwrap();
+            }
+        });
+
+        let test_root = unique_test_dir();
+        fs::create_dir_all(&test_root).unwrap();
+        let destination = test_root.join("template-cache");
+        let candidates = vec![
+            format!("http://{address}/not-a-zip"),
+            format!("http://{address}/template.zip"),
+        ];
+        let client = reqwest::Client::new();
+
+        download_and_extract(&client, &candidates, &destination)
+            .await
+            .unwrap();
+        server.await.unwrap();
+
+        assert_eq!(
+            fs::read_to_string(destination.join("README.md")).unwrap(),
+            "template contents"
+        );
+        assert!(!test_root.join(".template-cache.zip").exists());
+        assert!(!test_root.join(".template-cache.extracting").exists());
+
+        fs::remove_dir_all(test_root).unwrap();
+    }
+
+    fn test_zip() -> Vec<u8> {
+        let mut writer = zip::ZipWriter::new(Cursor::new(Vec::new()));
+        writer
+            .start_file("repository-root/README.md", SimpleFileOptions::default())
+            .unwrap();
+        writer.write_all(b"template contents").unwrap();
+        writer.finish().unwrap().into_inner()
+    }
+
+    fn unique_test_dir() -> PathBuf {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!(
+            "yudao-scaffold-download-test-{}-{nonce}",
+            std::process::id()
+        ))
+    }
 }

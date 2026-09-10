@@ -9,6 +9,8 @@
     "core:event:allow-unlisten",
     "dialog:default",
     "dialog:allow-open",
+    "process:allow-restart",
+    "updater:default",
     "shell:default"
   ]
 }

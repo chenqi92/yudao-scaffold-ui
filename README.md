@@ -46,11 +46,24 @@ pnpm tauri:build
 ```
 
 产物位于 `src-tauri/target/release/bundle/`：
-- macOS: `dmg/yudao-scaffold_0.1.0_aarch64.dmg`（~10 MB）
-- Windows: `msi/yudao-scaffold_0.1.0_x64_en-US.msi`
-- Linux: `deb/yudao-scaffold_0.1.0_amd64.deb` + `appimage/...`
+- macOS: `dmg/yudao-scaffold_0.1.1_aarch64.dmg`（~10 MB）
+- Windows: `msi/yudao-scaffold_0.1.1_x64_en-US.msi`
+- Linux: `deb/yudao-scaffold_0.1.1_amd64.deb` + `appimage/...`
 
 跨平台打包必须在对应平台系统上执行（macOS dmg 必须 macOS 出包，Windows msi 必须 Windows 出包）。
+
+## 自动更新
+
+从 `0.1.1` 开始，桌面应用启动后会在后台检查 GitHub Releases。发现更高版本时会询问用户，确认后下载经过签名的更新包、安装并重启应用；检查失败不会影响脚手架主流程。
+
+发布由 `.github/workflows/release.yml` 完成。将 `package.json`、`src-tauri/Cargo.toml` 和 `src-tauri/tauri.conf.json` 的版本号同步递增并推送到 `main` 后，workflow 会创建对应 `v<version>` Release，上传各平台安装包、更新签名和 `latest.json`。
+
+仓库必须配置以下 GitHub Actions Secrets：
+
+- `TAURI_SIGNING_PRIVATE_KEY`
+- `TAURI_SIGNING_PRIVATE_KEY_PASSWORD`
+
+私钥及密码必须安全备份且不能提交到仓库；丢失后，已经安装的客户端将无法验证后续更新。
 
 ## 关键文件
 
