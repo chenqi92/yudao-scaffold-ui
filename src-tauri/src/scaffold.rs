@@ -819,6 +819,7 @@ fn customize_backend_tree(root: &Path, answers: &ScaffoldAnswers) -> Result<usiz
     set_maven_revision_properties(root, &answers.version)?;
     relocate_java_packages(root, &answers.base_package)?;
     configure_backend_settings(root, answers)?;
+    prune_unselected_module_configs(root, &answers.modules)?;
     filter_unselected_module_sql(&root.join("sql"), &answers.modules)
 }
 
@@ -1094,11 +1095,21 @@ fn configure_connection_profile(
 ) -> Result<(), String> {
     if database.enabled {
         configure_database_yaml(path, database)?;
+    } else if !database.slave_enabled {
+        remove_disabled_slave_yaml(path)?;
     }
     if redis.enabled {
         configure_redis_yaml(path, redis)?;
     }
     Ok(())
+}
+
+fn remove_disabled_slave_yaml(path: &Path) -> Result<(), String> {
+    let text = fs::read_to_string(path)
+        .map_err(|e| format!("读取数据库配置失败 {}: {e}", path.display()))?;
+    let mut lines = text.lines().map(str::to_string).collect::<Vec<_>>();
+    remove_yaml_mapping_block(&mut lines, "slave", 8);
+    write_lines_preserving_final_newline(path, &text, lines, "移除未启用的从库配置")
 }
 
 fn configure_database_yaml(path: &Path, settings: &DatabaseSettings) -> Result<(), String> {
@@ -1174,6 +1185,7 @@ fn remove_yaml_mapping_block(lines: &mut Vec<String>, name: &str, indent: usize)
     while end < lines.len() {
         let line = &lines[end];
         if line.trim().is_empty()
+            || line.trim_start().starts_with('#')
             || line
                 .chars()
                 .take_while(|character| character.is_whitespace())
@@ -1186,6 +1198,154 @@ fn remove_yaml_mapping_block(lines: &mut Vec<String>, name: &str, indent: usize)
         }
     }
     lines.drain(start..end);
+}
+
+fn remove_empty_yaml_mapping_blocks(lines: &mut Vec<String>, name: &str, indent: usize) {
+    let marker = format!("{}{name}:", " ".repeat(indent));
+    let mut index = 0;
+    while index < lines.len() {
+        if lines[index].trim_end() != marker {
+            index += 1;
+            continue;
+        }
+        let has_child = lines[(index + 1)..]
+            .iter()
+            .find(|line| !line.trim().is_empty() && !line.trim_start().starts_with('#'))
+            .is_some_and(|line| {
+                line.chars()
+                    .take_while(|character| character.is_whitespace())
+                    .count()
+                    > indent
+            });
+        if has_child {
+            index += 1;
+        } else {
+            lines.remove(index);
+        }
+    }
+}
+
+fn prune_unselected_module_configs(root: &Path, selected_modules: &[String]) -> Result<(), String> {
+    let selected = selected_modules
+        .iter()
+        .map(String::as_str)
+        .collect::<HashSet<_>>();
+    prune_module_configs_in_tree(root, &selected)
+}
+
+fn prune_module_configs_in_tree(root: &Path, selected: &HashSet<&str>) -> Result<(), String> {
+    if !root.exists() {
+        return Ok(());
+    }
+    for entry in
+        fs::read_dir(root).map_err(|e| format!("读取配置目录失败 {}: {e}", root.display()))?
+    {
+        let entry = entry.map_err(|e| format!("读取配置目录项失败: {e}"))?;
+        let path = entry.path();
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if path.is_dir() {
+            if !matches!(name.as_ref(), ".git" | "node_modules" | "target") {
+                prune_module_configs_in_tree(&path, selected)?;
+            }
+            continue;
+        }
+        let is_application_yaml = name.starts_with("application")
+            && matches!(
+                path.extension().and_then(|extension| extension.to_str()),
+                Some("yaml" | "yml")
+            );
+        if is_application_yaml {
+            prune_module_config_file(&path, selected)?;
+        }
+    }
+    Ok(())
+}
+
+fn prune_module_config_file(path: &Path, selected: &HashSet<&str>) -> Result<(), String> {
+    let text = fs::read_to_string(path)
+        .map_err(|e| format!("读取模块配置失败 {}: {e}", path.display()))?;
+    let mut lines = text.lines().map(str::to_string).collect::<Vec<_>>();
+
+    // 演示代码已从生成项目中删除，对应配置也不应残留。
+    remove_yaml_mapping_block(&mut lines, "demo", 2);
+    if !selected.contains("bpm") {
+        remove_yaml_mapping_block(&mut lines, "flowable", 0);
+    }
+    if !selected.contains("mp") && !selected.contains("mall") {
+        minimize_required_wx_config(&mut lines);
+    }
+    if !selected.contains("pay") {
+        remove_yaml_mapping_block(&mut lines, "pay", 2);
+    }
+    if !selected.contains("ai") {
+        // 同时覆盖 spring.ai 与 yudao.ai；两者在模板中均为二级配置块。
+        while contains_yaml_mapping_block(&lines, "ai", 2) {
+            remove_yaml_mapping_block(&mut lines, "ai", 2);
+        }
+    }
+    if !selected.contains("mall") {
+        for name in [
+            "trade",
+            "wxa-code",
+            "wxa-subscribe-message",
+            "tencent-lbs-key",
+        ] {
+            remove_yaml_mapping_block(&mut lines, name, 2);
+        }
+    }
+    if !selected.contains("iot") {
+        remove_yaml_mapping_block(&mut lines, "iot", 2);
+    }
+    for parent in ["spring", "yudao"] {
+        remove_empty_yaml_mapping_blocks(&mut lines, parent, 0);
+    }
+
+    write_lines_preserving_final_newline(path, &text, lines, "裁剪未选模块配置")
+}
+
+fn contains_yaml_mapping_block(lines: &[String], name: &str, indent: usize) -> bool {
+    let marker = format!("{}{name}:", " ".repeat(indent));
+    lines.iter().any(|line| line.starts_with(&marker))
+}
+
+fn minimize_required_wx_config(lines: &mut Vec<String>) {
+    let Some(start) = lines.iter().position(|line| line.starts_with("wx:")) else {
+        return;
+    };
+    let mut end = start + 1;
+    while end < lines.len() {
+        let line = &lines[end];
+        if line.trim().is_empty()
+            || line.trim_start().starts_with('#')
+            || line.starts_with(char::is_whitespace)
+        {
+            end += 1;
+        } else {
+            break;
+        }
+    }
+    let minimal = [
+        "wx:",
+        "  mp:",
+        "    app-id: ${WX_MP_APP_ID:disabled}",
+        "    secret: ${WX_MP_SECRET:disabled}",
+        "    config-storage:",
+        "      type: RedisTemplate",
+        "      key-prefix: wx",
+        "      http-client-type: HttpComponents",
+        "  miniapp:",
+        "    appid: ${WX_MINIAPP_APP_ID:disabled}",
+        "    secret: ${WX_MINIAPP_SECRET:disabled}",
+        "    config-storage:",
+        "      type: RedisTemplate",
+        "      key-prefix: wa",
+        "      http-client-type: HttpComponents",
+        "",
+    ]
+    .into_iter()
+    .map(str::to_string);
+    lines.splice(start..end, minimal);
 }
 
 fn configure_redis_yaml(path: &Path, settings: &RedisSettings) -> Result<(), String> {
@@ -2475,6 +2635,13 @@ fn archive_url_candidates(url: &str, branch: Option<&str>) -> Vec<String> {
 }
 
 fn should_rewrite_file(path: &Path) -> bool {
+    let normalized = path.to_string_lossy().replace('\\', "/");
+    if normalized.contains("/META-INF/services/") || normalized.starts_with("META-INF/services/") {
+        return true;
+    }
+    if path.extension().is_none() {
+        return true;
+    }
     matches!(
         path.extension().and_then(|s| s.to_str()).unwrap_or(""),
         "java"
@@ -2492,6 +2659,12 @@ fn should_rewrite_file(path: &Path) -> bool {
             | "sql"
             | "env"
             | "txt"
+            | "factories"
+            | "imports"
+            | "sh"
+            | "cmd"
+            | "bat"
+            | "ps1"
     )
 }
 
@@ -2548,7 +2721,8 @@ fn emit_done(app: &AppHandle, output_dir: &str) {
 mod tests {
     use super::*;
     use std::io::{Cursor, Write};
-    use std::time::{SystemTime, UNIX_EPOCH};
+    use std::process::Stdio;
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
     use zip::write::SimpleFileOptions;
@@ -2785,6 +2959,97 @@ mod tests {
     }
 
     #[test]
+    fn rewrites_spring_runtime_metadata_and_service_descriptors() {
+        let test_root = unique_test_dir();
+        let metadata = test_root.join("src/main/resources/META-INF");
+        let spring = metadata.join("spring");
+        let services = metadata.join("services");
+        fs::create_dir_all(&spring).unwrap();
+        fs::create_dir_all(&services).unwrap();
+        let files = [
+            metadata.join("spring.factories"),
+            spring.join("org.springframework.boot.autoconfigure.AutoConfiguration.imports"),
+            services.join("com.example.FrameworkService"),
+            test_root.join("Dockerfile"),
+        ];
+        for path in &files {
+            fs::write(path, "cn.iocoder.yudao.framework.Example\n").unwrap();
+        }
+
+        rewrite_text_files(
+            &test_root,
+            &[("cn.iocoder.yudao", "com.example.application")],
+        )
+        .unwrap();
+
+        for path in files {
+            let text = fs::read_to_string(&path).unwrap();
+            assert!(
+                text.contains("com.example.application.framework.Example"),
+                "{} was not rewritten",
+                path.display()
+            );
+            assert!(!text.contains("cn.iocoder.yudao"));
+        }
+        fs::remove_dir_all(test_root).unwrap();
+    }
+
+    #[test]
+    fn prunes_only_unselected_module_configuration() {
+        let test_root = unique_test_dir();
+        let resources = test_root.join("server/src/main/resources");
+        fs::create_dir_all(&resources).unwrap();
+        let yaml = resources.join("application.yaml");
+        fs::write(
+            &yaml,
+            concat!(
+                "spring:\n",
+                "  cache:\n    type: redis\n",
+                "spring:\n",
+                "  ai:\n    openai:\n      api-key: test\n",
+                "flowable:\n  database-schema-update: true\n",
+                "wx:\n  mp:\n    app-id: test\n",
+                "yudao:\n",
+                "  info:\n    version: 1\n",
+                "  pay:\n    order-notify-url: test\n",
+                "  demo: true\n",
+                "  ai:\n    gemini:\n      enable: false\n",
+                "    midjourney:\n      enable: true\n",
+                "  # base-url: an optional commented example\n",
+                "      base-url: https://example.invalid\n",
+                "    suno:\n      enable: true\n",
+                "  trade:\n    order:\n      pay-expire-time: 1h\n",
+                "  iot:\n    message-bus:\n      type: local\n",
+                "  security:\n    permit-all_urls: []\n",
+            ),
+        )
+        .unwrap();
+
+        prune_unselected_module_configs(&test_root, &["system".into(), "infra".into()]).unwrap();
+
+        let configured = fs::read_to_string(yaml).unwrap();
+        for removed in [
+            "flowable:",
+            "  pay:",
+            "  demo:",
+            "  ai:",
+            "  trade:",
+            "  iot:",
+        ] {
+            assert!(!configured.contains(removed), "still contains {removed}");
+        }
+        assert!(configured.contains("  cache:"));
+        assert!(configured.contains("  info:"));
+        assert!(configured.contains("  security:"));
+        assert!(configured.contains("app-id: ${WX_MP_APP_ID:disabled}"));
+        assert!(configured.contains("appid: ${WX_MINIAPP_APP_ID:disabled}"));
+        assert!(!configured.contains("app-id: test"));
+        assert!(!configured.contains("midjourney:"));
+        assert!(!configured.contains("suno:"));
+        fs::remove_dir_all(test_root).unwrap();
+    }
+
+    #[test]
     fn staged_output_preserves_existing_content_until_commit() {
         let test_root = unique_test_dir();
         let target = test_root.join("project");
@@ -2937,6 +3202,44 @@ mod tests {
         assert!(configured.contains("database: 2"));
         assert!(configured.contains("password: \"redis:#password\""));
 
+        fs::remove_dir_all(test_root).unwrap();
+    }
+
+    #[test]
+    fn removes_template_slave_when_custom_database_is_disabled() {
+        let test_root = unique_test_dir();
+        fs::create_dir_all(&test_root).unwrap();
+        let yaml = test_root.join("application-dev.yaml");
+        fs::write(
+            &yaml,
+            concat!(
+                "spring:\n",
+                "  datasource:\n",
+                "    dynamic:\n",
+                "      datasource:\n",
+                "        master:\n",
+                "          url: jdbc:mysql://127.0.0.1/default\n",
+                "        slave:\n",
+                "          lazy: true\n",
+                "          url: jdbc:mysql://127.0.0.1/default\n",
+                "  data:\n",
+                "    redis:\n",
+                "      host: 127.0.0.1\n",
+            ),
+        )
+        .unwrap();
+
+        configure_connection_profile(
+            &yaml,
+            &DatabaseSettings::default(),
+            &RedisSettings::default(),
+        )
+        .unwrap();
+
+        let configured = fs::read_to_string(yaml).unwrap();
+        assert!(configured.contains("        master:"));
+        assert!(!configured.contains("        slave:"));
+        assert!(configured.contains("  data:"));
         fs::remove_dir_all(test_root).unwrap();
     }
 
@@ -3115,8 +3418,19 @@ mod tests {
         assert!(local_profile.contains("port: 6380"));
         assert!(local_profile.contains("database: 3"));
         assert!(local_profile.contains("password: \"redis:#secret\""));
+        assert!(!local_profile.contains("        slave:"));
+        assert!(local_profile.contains("app-id: ${WX_MP_APP_ID:disabled}"));
+        assert!(local_profile.contains("appid: ${WX_MINIAPP_APP_ID:disabled}"));
+        assert!(!local_profile.contains("  pay:"));
+        assert!(!local_profile.contains("  demo:"));
+
+        assert!(!application.contains("\nflowable:"));
+        assert!(!application.contains("  ai:"));
+        assert!(!application.contains("  trade:"));
+        assert!(!application.contains("  iot:"));
 
         audit_root_sql_has_no_unselected_business_tables(&backend.join("sql"));
+        audit_runtime_metadata_has_no_old_package(&backend);
         assert_eq!(
             filter_unselected_module_sql(&backend.join("sql"), &answers.modules).unwrap(),
             0,
@@ -3135,6 +3449,9 @@ mod tests {
                 String::from_utf8_lossy(&build.stdout),
                 String::from_utf8_lossy(&build.stderr)
             );
+            if std::env::var_os("YUDAO_SCAFFOLD_RUN_STARTUP").is_some() {
+                smoke_test_generated_server(&backend);
+            }
         }
         fs::remove_dir_all(test_root).unwrap();
     }
@@ -3234,6 +3551,78 @@ mod tests {
                     );
                 }
             }
+        }
+    }
+
+    fn audit_runtime_metadata_has_no_old_package(root: &Path) {
+        for entry in fs::read_dir(root).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                audit_runtime_metadata_has_no_old_package(&path);
+                continue;
+            }
+            let normalized = path.to_string_lossy().replace('\\', "/");
+            if !normalized.contains("/src/main/resources/META-INF/") {
+                continue;
+            }
+            let Ok(text) = fs::read_to_string(&path) else {
+                continue;
+            };
+            assert!(
+                !text.contains("cn.iocoder.yudao"),
+                "Spring runtime metadata still references the old package: {}",
+                path.display()
+            );
+        }
+    }
+
+    fn smoke_test_generated_server(backend: &Path) {
+        let target = backend.join("yudao-server").join("target");
+        let jar = fs::read_dir(&target)
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .find(|path| {
+                path.extension().and_then(|value| value.to_str()) == Some("jar")
+                    && !path.to_string_lossy().ends_with(".jar.original")
+            })
+            .expect("generated server jar is missing");
+        let mut child = std::process::Command::new("java")
+            .arg("-jar")
+            .arg(jar)
+            .args([
+                "--spring.boot.admin.client.enabled=false",
+                "--spring.datasource.dynamic.datasource.master.url=jdbc:mysql://127.0.0.1:1/local_audit?connectTimeout=1000&socketTimeout=1000",
+                "--spring.data.redis.host=127.0.0.1",
+                "--spring.data.redis.port=1",
+            ])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("failed to start generated server jar");
+        std::thread::sleep(Duration::from_secs(12));
+        if child.try_wait().unwrap().is_none() {
+            child.kill().unwrap();
+        }
+        let output = child.wait_with_output().unwrap();
+        let logs = format!(
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            logs.contains("Starting YudaoServerApplication")
+                || logs.contains("Started YudaoServerApplication"),
+            "generated server did not reach Spring application startup\n{logs}"
+        );
+        for forbidden in [
+            "Unable to instantiate factory class",
+            "ClassNotFoundException: cn.iocoder.yudao",
+        ] {
+            assert!(
+                !logs.contains(forbidden),
+                "generated server still has stale Spring metadata: {forbidden}\n{logs}"
+            );
         }
     }
 

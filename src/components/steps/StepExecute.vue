@@ -101,7 +101,7 @@ const backendTpl = computed(() => templateStatus(backendTemplateName()));
       <dt>数据库</dt>
       <dd>
         {{ form.database.enabled ? '自定义主库' : '模板默认配置' }}
-        <span v-if="form.database.enabled && form.database.slaveEnabled"> · 启用从库</span>
+        <span> · 从库{{ form.database.slaveEnabled ? '启用' : '关闭' }}</span>
       </dd>
 
       <dt>Redis</dt>

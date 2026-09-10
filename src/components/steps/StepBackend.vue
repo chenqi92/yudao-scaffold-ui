@@ -110,20 +110,21 @@ const { form, setMicroservicePort, moduleSubName, backendConnectionValid } = use
         <el-form-item label="主库密码">
           <el-input v-model="form.database.password" show-password />
         </el-form-item>
-        <el-form-item label="启用从库">
-          <el-switch v-model="form.database.slaveEnabled" />
+      </template>
+      <el-form-item label="启用从库">
+        <el-switch v-model="form.database.slaveEnabled" />
+        <span class="field-help">关闭时会从生成配置中移除模板自带的从库</span>
+      </el-form-item>
+      <template v-if="form.database.enabled && form.database.slaveEnabled">
+        <el-form-item label="从库 JDBC URL">
+          <el-input v-model="form.database.slaveUrl" placeholder="jdbc:mysql://..." />
         </el-form-item>
-        <template v-if="form.database.slaveEnabled">
-          <el-form-item label="从库 JDBC URL">
-            <el-input v-model="form.database.slaveUrl" placeholder="jdbc:mysql://..." />
-          </el-form-item>
-          <el-form-item label="从库账号">
-            <el-input v-model="form.database.slaveUsername" />
-          </el-form-item>
-          <el-form-item label="从库密码">
-            <el-input v-model="form.database.slavePassword" show-password />
-          </el-form-item>
-        </template>
+        <el-form-item label="从库账号">
+          <el-input v-model="form.database.slaveUsername" />
+        </el-form-item>
+        <el-form-item label="从库密码">
+          <el-input v-model="form.database.slavePassword" show-password />
+        </el-form-item>
       </template>
 
       <div class="group-title">Redis 连接</div>
